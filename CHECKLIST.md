@@ -109,7 +109,5 @@ Status: **M1–M4 done. M5–M10 not started.**
 - [ ] Leak check for veth devices / nftables rules (M7)
 
 ## Repo / process notes
-- Code is pushed to `kilo/linear-drum-l4r` on `AlvinPlayz23/minibox` (also branch `minibox-m1-m4`; PR #1 is open but now has no diff).
-- A GitHub token was pasted into the chat to enable the push. It was not stored, but **revoke it**.
 - My local commits had initially included `.agent-sessions/`, `.cursor/`, `AGENTS.md` and `index.html`. They were removed from the pushed history and added to `.gitignore`.
 - Bugs found by the cross-milestone testing and fixed: spec pipe deadlock with many layers, `.oldroot` race between parallel containers, prune touching another root's cgroups, regexp compile cost at startup.
