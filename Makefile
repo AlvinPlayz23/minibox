@@ -6,7 +6,7 @@ build:
 	@ls -l $(BIN) | awk '{print "binary size:", $$5, "bytes"}'
 test:
 	go test ./...
-test-integration:
+test-integration: build
 	MINIBOX_ROOT=$$(mktemp -d) go test -tags integration ./test/integration/...
 bench: build
 	bench/run.sh

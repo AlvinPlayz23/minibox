@@ -13,6 +13,9 @@ import (
 // Root returns $MINIBOX_ROOT (default /var/lib/minibox, or ~/.local/share/minibox when not root).
 func Root() string {
 	if v := os.Getenv("MINIBOX_ROOT"); v != "" {
+		if a, err := filepath.Abs(v); err == nil {
+			return a
+		}
 		return v
 	}
 	if os.Geteuid() != 0 {
@@ -60,4 +63,10 @@ func Release(id string, f *os.File) {
 	if f != nil {
 		f.Close()
 	}
+}
+
+// HasLock reports whether a lock file for id exists under this root.
+func HasLock(id string) bool {
+	_, err := os.Stat(lockPath(id))
+	return err == nil
 }

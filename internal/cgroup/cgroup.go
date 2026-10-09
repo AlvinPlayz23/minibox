@@ -214,3 +214,9 @@ func ParseSize(s string) (int64, error) {
 	}
 	return n * mult, nil
 }
+
+// HasProcs reports whether the cgroup (or a child) still has processes.
+func HasProcs(path string) bool {
+	b, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	return err == nil && len(strings.TrimSpace(string(b))) > 0
+}

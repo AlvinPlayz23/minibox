@@ -8,33 +8,92 @@ package runtime
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/image"
 	"minibox/internal/state"
+	"minibox/internal/storage"
 )
 
-// RunRaw runs cmd in new PID/mount/UTS/IPC/net namespaces chrooted into rootfs.
+// RunOptions configures RunRaw.
+type RunOptions struct {
+	Rootfs string // plain directory rootfs (mutually exclusive with Image)
+	Image  string // image name in the store
+	Cmd    []string
+	Limits cgroup.Limits
+	Keep   bool // keep the container dir (upper layer) after exit, for inspection
+}
+
+// initSpec is passed from the supervisor to the init stage as JSON on fd 3.
+type initSpec struct {
+	Rootfs  string
+	Overlay *storage.Overlay
+	Cmd     []string
+	Env     []string
+	Workdir string
+}
+
+// RunRaw runs a command in new PID/mount/UTS/IPC/net namespaces on a pivot_rooted
+// rootfs: either a plain directory or an overlay of an image's layers.
 // Returns the child's exit code.
-func RunRaw(rootfs string, cmd []string, lim cgroup.Limits) (int, error) {
-	st, err := os.Stat(rootfs)
-	if err != nil || !st.IsDir() {
-		return 125, fmt.Errorf("rootfs %q is not a directory; extract an Alpine minirootfs there first (see bench/fetch-rootfs.sh)", rootfs)
-	}
-	abs, err := absPath(rootfs)
-	if err != nil {
-		return 125, err
-	}
+func RunRaw(o RunOptions) (int, error) {
+	lim, cmd := o.Limits, o.Cmd
+	spec := initSpec{Cmd: cmd, Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=" + os.Getenv("TERM")}}
 	id, err := newID()
 	if err != nil {
 		return 125, err
+	}
+	var cdirs *storage.ContainerDirs
+	if o.Image != "" {
+		st := &image.Store{Root: state.Root()}
+		img, err := st.GetImage(o.Image)
+		if err != nil {
+			return 125, err
+		}
+		lowers, err := st.LowerDirs(img)
+		if err != nil {
+			return 125, err
+		}
+		cdirs, err = storage.NewContainerDirs(st.Root, id)
+		if err != nil {
+			return 125, err
+		}
+		if !o.Keep {
+			defer cdirs.Remove()
+		}
+		ov := &storage.Overlay{Upper: cdirs.Upper, Work: cdirs.Work, Target: cdirs.Merged}
+		for _, l := range lowers {
+			ov.Lowers = append(ov.Lowers, storage.Lower{Dir: l.Dir, Short: l.Short})
+		}
+		spec.Overlay, spec.Rootfs = ov, cdirs.Merged
+		spec.Env = mergeEnv(img.Config.Env)
+		spec.Workdir = img.Config.WorkingDir
+		if len(cmd) == 0 {
+			cmd = img.Config.Cmd
+		}
+		spec.Cmd = append(append([]string(nil), img.Config.Entrypoint...), cmd...)
+		if len(spec.Cmd) == 0 {
+			return 125, fmt.Errorf("image %s has no default command; pass one: minibox run-raw --image %s CMD...", o.Image, o.Image)
+		}
+	} else {
+		st, err := os.Stat(o.Rootfs)
+		if err != nil || !st.IsDir() {
+			return 125, fmt.Errorf("rootfs %q is not a directory; extract an Alpine minirootfs there first (see bench/fetch-rootfs.sh)", o.Rootfs)
+		}
+		if spec.Rootfs, err = absPath(o.Rootfs); err != nil {
+			return 125, err
+		}
 	}
 	lock, err := state.HoldLock(id)
 	if err != nil {
@@ -51,7 +110,14 @@ func RunRaw(rootfs string, cmd []string, lim cgroup.Limits) (int, error) {
 		return 125, err
 	}
 	defer unix.Close(fd)
-	c := exec.Command("/proc/self/exe", append([]string{"init", abs}, cmd...)...)
+	specR, specW, err := os.Pipe()
+	if err != nil {
+		return 125, err
+	}
+	defer specR.Close()
+	sb, _ := json.Marshal(spec)
+	c := exec.Command("/proc/self/exe", "init")
+	c.ExtraFiles = []*os.File{specR} // becomes fd 3 in the child
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS |
@@ -61,8 +127,14 @@ func RunRaw(rootfs string, cmd []string, lim cgroup.Limits) (int, error) {
 		CgroupFD:    fd,
 	}
 	if err := c.Start(); err != nil {
+		specW.Close()
 		return 125, fmt.Errorf("start container (need root or CAP_SYS_ADMIN): %w", err)
 	}
+	// Written concurrently: the spec can exceed the 64 KiB pipe buffer (many layers).
+	go func() {
+		specW.Write(sb)
+		specW.Close()
+	}()
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -85,12 +157,40 @@ func RunRaw(rootfs string, cmd []string, lim cgroup.Limits) (int, error) {
 	return 0, err
 }
 
-// Init runs inside the new namespaces as PID 1: args = ROOTFS CMD...
-func Init(args []string) error {
-	if len(args) < 2 {
-		return errors.New("init: missing arguments")
+// mergeEnv returns the container env: image env with defaults for PATH/HOME/TERM.
+func mergeEnv(img []string) []string {
+	env := append([]string(nil), img...)
+	has := func(k string) bool {
+		for _, e := range env {
+			if len(e) > len(k) && e[:len(k)+1] == k+"=" {
+				return true
+			}
+		}
+		return false
 	}
-	rootfs, cmd := args[0], args[1:]
+	if !has("PATH") {
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !has("HOME") {
+		env = append(env, "HOME=/root")
+	}
+	if t := os.Getenv("TERM"); t != "" && !has("TERM") {
+		env = append(env, "TERM="+t)
+	}
+	return env
+}
+
+// Init runs inside the new namespaces as PID 1; the spec arrives on fd 3.
+func Init() error {
+	f := os.NewFile(3, "spec")
+	var spec initSpec
+	if err := json.NewDecoder(f).Decode(&spec); err != nil {
+		return fmt.Errorf("init: read spec: %w", err)
+	}
+	f.Close()
+	if len(spec.Cmd) == 0 {
+		return errors.New("init: no command")
+	}
 	// Make mounts private so nothing propagates to the host.
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make / private: %w", err)
@@ -98,21 +198,37 @@ func Init(args []string) error {
 	if err := unix.Sethostname([]byte("minibox")); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
-	if err := setupRootfs(rootfs); err != nil {
+	if spec.Overlay != nil {
+		if err := spec.Overlay.Mount(); err != nil {
+			return err
+		}
+	}
+	if err := setupRootfs(spec.Rootfs); err != nil {
 		return err
 	}
-	path, err := lookPath(cmd[0])
+	if spec.Workdir != "" {
+		if err := unix.Chdir(spec.Workdir); err != nil {
+			return fmt.Errorf("chdir %s: %w (WorkingDir from image config)", spec.Workdir, err)
+		}
+	}
+	path, err := lookPath(spec.Cmd[0], spec.Env)
 	if err != nil {
 		return err
 	}
-	return unix.Exec(path, cmd, []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=" + os.Getenv("TERM")})
+	return unix.Exec(path, spec.Cmd, spec.Env)
 }
 
-func lookPath(name string) (string, error) {
-	if len(name) > 0 && name[0] == '/' {
+func lookPath(name string, env []string) (string, error) {
+	if strings.Contains(name, "/") {
 		return name, nil
 	}
-	for _, d := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+	path := "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "PATH="); ok {
+			path = v
+		}
+	}
+	for _, d := range strings.Split(path, ":") {
 		p := d + "/" + name
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p, nil
@@ -143,8 +259,26 @@ func Prune() (int, error) {
 		return 0, err
 	}
 	n := 0
+	// Container dirs of dead supervisors (M5 adds persistent containers, which have state.json and are kept).
+	if ents, _ := os.ReadDir(filepath.Join(state.Root(), "containers")); ents != nil {
+		for _, e := range ents {
+			dir := filepath.Join(state.Root(), "containers", e.Name())
+			if _, err := os.Stat(filepath.Join(dir, "state.json")); err == nil || state.IsAlive(e.Name()) {
+				continue
+			}
+			if err := os.RemoveAll(dir); err != nil {
+				return n, err
+			}
+			n++
+		}
+	}
 	for _, id := range cgroup.List() {
 		if state.IsAlive(id) {
+			continue
+		}
+		// A cgroup with no lock file under *this* MINIBOX_ROOT may belong to another
+		// root's live container: only remove it if it is empty.
+		if !state.HasLock(id) && cgroup.HasProcs(cgroup.Base()+"/"+id) {
 			continue
 		}
 		if err := cgroup.RemovePath(cgroup.Base() + "/" + id); err != nil {

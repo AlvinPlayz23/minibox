@@ -139,20 +139,25 @@ func readonlyPath(p string) error {
 	return unix.Mount("", p, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY|unix.MS_REC|unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, "")
 }
 
-// pivot swaps the root to newroot and drops the old one.
+// pivot swaps the root to newroot and drops the old one. It uses
+// pivot_root(".", ".") so no put_old directory is created inside the rootfs
+// (which may be shared by concurrent containers); the old root is stacked
+// under the new one and lazily unmounted.
 func pivot(newroot string) error {
-	old := filepath.Join(newroot, ".oldroot")
-	if err := os.MkdirAll(old, 0o700); err != nil {
-		return err
+	fd, err := unix.Open(newroot, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open new root: %w", err)
 	}
-	if err := unix.PivotRoot(newroot, old); err != nil {
+	defer unix.Close(fd)
+	if err := unix.Fchdir(fd); err != nil {
+		return fmt.Errorf("chdir new root: %w", err)
+	}
+	if err := unix.PivotRoot(".", "."); err != nil {
 		return fmt.Errorf("pivot_root: %w", err)
 	}
-	if err := unix.Chdir("/"); err != nil {
-		return err
-	}
-	if err := unix.Unmount("/.oldroot", unix.MNT_DETACH); err != nil {
+	// The old root is now mounted on top of "." ; detach it.
+	if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
 		return fmt.Errorf("unmount old root: %w", err)
 	}
-	return os.Remove("/.oldroot")
+	return unix.Chdir("/")
 }

@@ -7,13 +7,17 @@ export PATH="$HOME/.local/share/mise/shims:$PATH"
 ROOTFS=${ROOTFS:-$PWD/rootfs}
 [ -d "$ROOTFS/bin" ] || bench/fetch-rootfs.sh "$ROOTFS"
 CMDS="$PWD/bin/minibox run-raw $ROOTFS /bin/true"
+# Image (overlayfs) variant: load the same rootfs as an image into a scratch store.
+export MINIBOX_ROOT=$(mktemp -d)
+tar -C "$ROOTFS" -cf - . | "$PWD/bin/minibox" load benchimg >/dev/null
+IMGCMD="$PWD/bin/minibox run-raw --image benchimg /bin/true"
 if command -v runc >/dev/null; then
   B=$(mktemp -d); cp -a "$ROOTFS" "$B/rootfs"
   (cd "$B" && runc spec && sed -i 's/"terminal": true/"terminal": false/; s/"sh"/"\/bin\/true"/' config.json)
   RUNC="cd $B && runc run mb-bench-\$\$"
 fi
 set -- -N --warmup 5 --runs ${RUNS:-50} --export-markdown /tmp/bench.md
-set -- "$@" -n minibox "$CMDS"
+set -- "$@" -n minibox-dir "$CMDS" -n minibox-image "$IMGCMD"
 if command -v crun >/dev/null; then :; fi
 [ -n "$RUNC" ] && set -- "$@" -n runc "sh -c '$RUNC'"
 if docker info >/dev/null 2>&1 && docker image inspect alpine >/dev/null 2>&1; then set -- "$@" -n docker "docker run --rm alpine true"; fi
