@@ -6,6 +6,8 @@
 package runtime
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -14,11 +16,14 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"minibox/internal/cgroup"
+	"minibox/internal/state"
 )
 
 // RunRaw runs cmd in new PID/mount/UTS/IPC/net namespaces chrooted into rootfs.
 // Returns the child's exit code.
-func RunRaw(rootfs string, cmd []string) (int, error) {
+func RunRaw(rootfs string, cmd []string, lim cgroup.Limits) (int, error) {
 	st, err := os.Stat(rootfs)
 	if err != nil || !st.IsDir() {
 		return 125, fmt.Errorf("rootfs %q is not a directory; extract an Alpine minirootfs there first (see bench/fetch-rootfs.sh)", rootfs)
@@ -27,12 +32,33 @@ func RunRaw(rootfs string, cmd []string) (int, error) {
 	if err != nil {
 		return 125, err
 	}
+	id, err := newID()
+	if err != nil {
+		return 125, err
+	}
+	lock, err := state.HoldLock(id)
+	if err != nil {
+		return 125, fmt.Errorf("lock container: %w; check that MINIBOX_ROOT (%s) is writable", err, state.Root())
+	}
+	defer state.Release(id, lock)
+	cg, err := cgroup.Create(id, lim)
+	if err != nil {
+		return 125, err
+	}
+	defer cg.Remove()
+	fd, err := cg.OpenFD()
+	if err != nil {
+		return 125, err
+	}
+	defer unix.Close(fd)
 	c := exec.Command("/proc/self/exe", append([]string{"init", abs}, cmd...)...)
 	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS |
 			syscall.CLONE_NEWIPC | syscall.CLONE_NEWNET,
-		Pdeathsig: syscall.SIGKILL,
+		Pdeathsig:   syscall.SIGKILL,
+		UseCgroupFD: true,
+		CgroupFD:    fd,
 	}
 	if err := c.Start(); err != nil {
 		return 125, fmt.Errorf("start container (need root or CAP_SYS_ADMIN): %w", err)
@@ -45,6 +71,10 @@ func RunRaw(rootfs string, cmd []string) (int, error) {
 		}
 	}()
 	err = c.Wait()
+	signal.Stop(sigs)
+	if ev := cg.MemoryEvents(); ev.OOMKill > 0 {
+		fmt.Fprintf(os.Stderr, "minibox: container was OOM-killed (%d process(es) killed; memory limit %d bytes); raise --memory\n", ev.OOMKill, lim.MemoryBytes)
+	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
@@ -97,4 +127,31 @@ func absPath(p string) (string, error) {
 	}
 	wd, err := os.Getwd()
 	return wd + "/" + p, err
+}
+
+func newID() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// Prune removes cgroups and lock files of containers whose supervisor is gone.
+func Prune() (int, error) {
+	if err := cgroup.Check(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, id := range cgroup.List() {
+		if state.IsAlive(id) {
+			continue
+		}
+		if err := cgroup.RemovePath(cgroup.Base() + "/" + id); err != nil {
+			return n, err
+		}
+		state.Release(id, nil)
+		n++
+	}
+	return n, nil
 }

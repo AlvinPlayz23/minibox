@@ -20,3 +20,11 @@ Binary size: 1.96 MB. High variance is from a shared VM. Target <50 ms is met at
 | `minibox run-raw rootfs /bin/true` | 50.4 ± 22.3 (min 28.3) |
 
 Binary 1.98 MB. Not slower than M1 (VM noise dominates).
+
+## M3 (cgroup v2, CLONE_INTO_CGROUP)
+
+| Command | Mean wall [ms] |
+|---|---:|
+| `minibox run-raw rootfs /bin/true` (cgroup created+removed) | 57.2 ± 16.5 (min 32.2) |
+
+Binary 2.27 MB. ~+7 ms mean vs M2 is within VM noise but plausibly the cgroup mkdir/rmdir + flock; revisit in M10.

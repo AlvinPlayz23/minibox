@@ -1,3 +1,4 @@
+.PHONY: build test test-integration bench lint
 export PATH := $(HOME)/.local/share/mise/shims:$(PATH)
 BIN=bin/minibox
 build:
