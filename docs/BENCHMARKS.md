@@ -12,3 +12,11 @@ Binary: `CGO_ENABLED=0 -trimpath -ldflags="-s -w"`.
 | docker / podman | n/a | alpine image not pulled / podman not installed on this VM |
 
 Binary size: 1.96 MB. High variance is from a shared VM. Target <50 ms is met at best-case (min 38 ms); revisit in M10.
+
+## M2 (pivot_root + /dev, /sys, masks)
+
+| Command | Mean wall [ms] |
+|---|---:|
+| `minibox run-raw rootfs /bin/true` | 50.4 ± 22.3 (min 28.3) |
+
+Binary 1.98 MB. Not slower than M1 (VM noise dominates).

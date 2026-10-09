@@ -68,16 +68,8 @@ func Init(args []string) error {
 	if err := unix.Sethostname([]byte("minibox")); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
-	if err := unix.Chroot(rootfs); err != nil {
-		return fmt.Errorf("chroot %s: %w", rootfs, err)
-	}
-	if err := unix.Chdir("/"); err != nil {
+	if err := setupRootfs(rootfs); err != nil {
 		return err
-	}
-	// /proc so ps shows only this PID namespace (mount ns is private; dies with it).
-	_ = os.MkdirAll("/proc", 0o555)
-	if err := unix.Mount("proc", "/proc", "proc", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, ""); err != nil {
-		return fmt.Errorf("mount /proc: %w", err)
 	}
 	path, err := lookPath(cmd[0])
 	if err != nil {
