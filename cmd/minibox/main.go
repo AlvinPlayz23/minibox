@@ -24,6 +24,18 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		cli.Run(os.Args[2:])
+	case "build":
+		cli.Build(os.Args[2:])
+	case "up":
+		cli.Up(os.Args[2:])
+	case "down":
+		cli.Down(os.Args[2:])
+	case "volume":
+		cli.Volume(os.Args[2:])
+	case "systemd":
+		cli.Systemd(os.Args[2:])
+	case "healthcheck":
+		cli.Healthcheck(os.Args[2:])
 	case "pull":
 		cli.Pull(os.Args[2:])
 	case "images":
@@ -145,5 +157,5 @@ func load(args []string) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: minibox run-raw [flags] (ROOTFS CMD... | --image NAME [CMD...]) | load | system prune | version")
+	fmt.Fprintln(os.Stderr, "usage: minibox run|build|up|down|ps|images|pull|exec|logs|stop|rm|rmi|inspect|volume|systemd|healthcheck|load|system prune|version")
 }

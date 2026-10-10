@@ -17,32 +17,36 @@ import (
 
 	"minibox/internal/cgroup"
 	"minibox/internal/network"
+	"minibox/internal/runtime"
 	"minibox/internal/state"
 )
 
 // Config is the resolved, immutable runtime configuration (config.json).
 type Config struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name,omitempty"`
-	Image       string         `json:"image,omitempty"`
-	Rootfs      string         `json:"rootfs,omitempty"` // plain-directory rootfs (dev; no image)
-	Cmd         []string       `json:"cmd"`
-	Env         []string       `json:"env"`
-	Workdir     string         `json:"workdir,omitempty"`
-	Hostname    string         `json:"hostname"`
-	User        string         `json:"user,omitempty"`
-	TTY         bool           `json:"tty,omitempty"`
-	Interactive bool           `json:"interactive,omitempty"`
-	Init        bool           `json:"init"`
-	Rm          bool           `json:"rm,omitempty"`
-	Detach      bool           `json:"detach,omitempty"`
-	Caps        []string       `json:"caps"`
-	Seccomp     bool           `json:"seccomp"`
-	ReadOnly    bool           `json:"readOnly,omitempty"`
-	Network     string         `json:"network"` // bridge, host, none, pasta
-	Ports       []network.Port `json:"ports,omitempty"`
-	Limits      cgroup.Limits  `json:"limits"`
-	Created     time.Time      `json:"created"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name,omitempty"`
+	Image       string          `json:"image,omitempty"`
+	Rootfs      string          `json:"rootfs,omitempty"` // plain-directory rootfs (dev; no image)
+	Cmd         []string        `json:"cmd"`
+	Env         []string        `json:"env"`
+	Workdir     string          `json:"workdir,omitempty"`
+	Hostname    string          `json:"hostname"`
+	User        string          `json:"user,omitempty"`
+	TTY         bool            `json:"tty,omitempty"`
+	Interactive bool            `json:"interactive,omitempty"`
+	Init        bool            `json:"init"`
+	Rm          bool            `json:"rm,omitempty"`
+	Detach      bool            `json:"detach,omitempty"`
+	Mounts      []runtime.Mount `json:"mounts,omitempty"`
+	Restart     string          `json:"restart,omitempty"`
+	HealthCmd   []string        `json:"healthCmd,omitempty"`
+	Caps        []string        `json:"caps"`
+	Seccomp     bool            `json:"seccomp"`
+	ReadOnly    bool            `json:"readOnly,omitempty"`
+	Network     string          `json:"network"` // bridge, host, none, pasta
+	Ports       []network.Port  `json:"ports,omitempty"`
+	Limits      cgroup.Limits   `json:"limits"`
+	Created     time.Time       `json:"created"`
 }
 
 // State is the mutable container state (state.json).

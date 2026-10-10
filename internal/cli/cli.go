@@ -19,12 +19,15 @@ import (
 	"time"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/build"
+	"minibox/internal/compose"
 	"minibox/internal/container"
 	"minibox/internal/image"
 	"minibox/internal/network"
 	"minibox/internal/runtime"
 	"minibox/internal/security"
 	"minibox/internal/state"
+	"minibox/internal/volume"
 )
 
 func die(code int, format string, a ...any) {
@@ -88,7 +91,7 @@ func exitCode(err error) int {
 // Run implements `minibox run [flags] IMAGE [CMD...]`.
 func Run(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	var env, pubs, capAdd, capDrop listFlag
+	var env, pubs, capAdd, capDrop, vols, tmpfs listFlag
 	detach := fs.Bool("d", false, "run in the background and print the container id")
 	fs.BoolVar(detach, "detach", false, "")
 	rm := fs.Bool("rm", false, "remove the container when it exits")
@@ -108,16 +111,22 @@ func Run(args []string) {
 	fs.Var(&capDrop, "cap-drop", "drop a Linux capability (repeatable), e.g. NET_RAW or ALL")
 	seccompF := fs.String("seccomp", "default", "seccomp profile: default or unconfined")
 	readOnly := fs.Bool("read-only", false, "mount the container's root filesystem read-only")
+	fs.Var(&vols, "v", "bind mount or named volume SRC:DST[:ro] (repeatable)")
+	fs.Var(&vols, "volume", "same as -v")
+	fs.Var(&tmpfs, "tmpfs", "tmpfs mount DST[:size=64m][,ro] (repeatable)")
+	restart := fs.String("restart", "", "restart policy: no, always, on-failure[:N], unless-stopped")
+	healthCmd := fs.String("health-cmd", "", "healthcheck command run by `minibox healthcheck NAME`")
 	initF := fs.Bool("init", true, "run a tiny init as PID 1 (reaps zombies, forwards signals)")
 	rootfs := fs.String("rootfs", "", "run a plain directory rootfs instead of an image (dev)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `usage: minibox run [flags] IMAGE [CMD...]
   -d/--detach  --rm  --name NAME  -i  -t  (-it)  -e KEY=VAL  -w DIR  -u USER
-  -p HOST:CONT[/udp]  --network bridge|host|none|pasta
+  -v SRC:DST[:ro]  --tmpfs DST[:size=64m][,ro]  -p HOST:CONT[/udp]  --network bridge|host|none|pasta
+  --restart no|always|on-failure[:N]|unless-stopped  --health-cmd "CMD..."
   --cap-add CAP  --cap-drop CAP  --seccomp default|unconfined  --read-only
   --memory 64m  --cpus 0.5  --pids-limit N  --hostname NAME  --init=false  --rootfs DIR`)
 	}
-	fs.Parse(expandShort(args, "dit", "e", "p", "w", "u", "cap-add", "cap-drop", "seccomp", "network", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
+	fs.Parse(expandShort(args, "dit", "e", "p", "v", "volume", "tmpfs", "w", "u", "cap-add", "cap-drop", "seccomp", "restart", "health-cmd", "network", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
 	if fs.NArg() < 1 && *rootfs == "" {
 		fs.Usage()
 		os.Exit(2)
@@ -187,6 +196,31 @@ func Run(args []string) {
 		die(2, "--seccomp must be default or unconfined")
 	}
 	cfg.Seccomp, cfg.ReadOnly = *seccompF == "default", *readOnly
+	if cfg.Restart, cerr = normalizeRestart(*restart); cerr != nil {
+		die(2, "%v", cerr)
+	}
+	if *healthCmd != "" {
+		cfg.HealthCmd = build.SplitArgs(*healthCmd)
+		if len(cfg.HealthCmd) == 0 {
+			die(2, "--health-cmd is empty")
+		}
+	}
+	for _, v := range vols {
+		m, err := runtime.ParseVolume(v, func(name string) (string, error) {
+			return volume.Ensure(state.Root(), name)
+		})
+		if err != nil {
+			die(2, "%v", err)
+		}
+		cfg.Mounts = append(cfg.Mounts, m)
+	}
+	for _, t := range tmpfs {
+		m, err := runtime.ParseTmpfs(t)
+		if err != nil {
+			die(2, "%v", err)
+		}
+		cfg.Mounts = append(cfg.Mounts, m)
+	}
 	cfg.Network = *netw
 	if cfg.Network == "" {
 		var why string
@@ -599,6 +633,323 @@ func shortID(d string) string {
 	return d
 }
 
+// normalizeRestart validates --restart no|always|on-failure[:N]|unless-stopped.
+func normalizeRestart(s string) (string, error) {
+	if s == "" || s == "no" {
+		return "", nil
+	}
+	if s == "always" || s == "unless-stopped" || s == "on-failure" {
+		return s, nil
+	}
+	if rest, ok := strings.CutPrefix(s, "on-failure:"); ok {
+		n := 0
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				return "", fmt.Errorf("invalid --restart %q; use no, always, on-failure[:N] or unless-stopped", s)
+			}
+			n = n*10 + int(r-'0')
+		}
+		if rest == "" || n <= 0 {
+			return "", fmt.Errorf("invalid --restart %q; on-failure count must be a positive number", s)
+		}
+		return s, nil
+	}
+	return "", fmt.Errorf("invalid --restart %q; use no, always, on-failure[:N] or unless-stopped", s)
+}
+
+// Systemd implements `minibox systemd [-o DIR] CONTAINER`: writes a unit file that
+// runs the container foreground with the same image/command/flags (no daemon needed).
+// Systemd implements `minibox systemd [-o DIR] CONTAINER`: writes a unit file that
+// runs the container foreground with the same image/command/flags (no daemon needed).
+func Systemd(args []string) {
+	fs := flag.NewFlagSet("systemd", flag.ExitOnError)
+	out := fs.String("o", "", "output directory (default: print to stdout)")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		die(2, "usage: minibox systemd [-o DIR] CONTAINER")
+	}
+	c, err := container.Resolve(fs.Arg(0))
+	if err != nil {
+		die(1, "%v", err)
+	}
+	bin, err := os.Executable()
+	if err != nil {
+		bin = "minibox"
+	}
+	cfg := c.Config
+	var argv []string
+	argv = append(argv, "run", "--rm", "--network", cfg.Network)
+	if cfg.Name != "" {
+		argv = append(argv, "--name", cfg.Name)
+	}
+	for _, e := range cfg.Env {
+		argv = append(argv, "-e", e)
+	}
+	for _, p := range cfg.Ports {
+		argv = append(argv, "-p", fmt.Sprintf("%d:%d/%s", p.HostPort, p.Container, p.Proto))
+	}
+	for _, m := range cfg.Mounts {
+		switch m.Type {
+		case "bind":
+			s := m.Src + ":" + m.Dst
+			if m.RO {
+				s += ":ro"
+			}
+			argv = append(argv, "-v", s)
+		case "tmpfs":
+			s := m.Dst
+			if m.Size != "" || m.RO {
+				s += ":"
+				if m.Size != "" {
+					s += "size=" + m.Size
+				}
+				if m.RO {
+					if m.Size != "" {
+						s += ","
+					}
+					s += "ro"
+				}
+			}
+			argv = append(argv, "--tmpfs", s)
+		}
+	}
+	if cfg.Workdir != "" {
+		argv = append(argv, "-w", cfg.Workdir)
+	}
+	if cfg.User != "" {
+		argv = append(argv, "-u", cfg.User)
+	}
+	if cfg.Hostname != "" {
+		argv = append(argv, "--hostname", cfg.Hostname)
+	}
+	if cfg.ReadOnly {
+		argv = append(argv, "--read-only")
+	}
+	if !cfg.Seccomp {
+		argv = append(argv, "--seccomp", "unconfined")
+	}
+	if len(cfg.Caps) > 0 {
+		argv = append(argv, "--cap-drop", "ALL", "--cap-add", strings.Join(cfg.Caps, ","))
+	}
+	// Fix up the cap-add above: emit one flag per capability.
+	var final []string
+	for i := 0; i < len(argv); i++ {
+		if argv[i] == "--cap-add" && i+1 < len(argv) {
+			for _, cp := range strings.Split(argv[i+1], ",") {
+				final = append(final, "--cap-add", cp)
+			}
+			i++
+			continue
+		}
+		final = append(final, argv[i])
+	}
+	argv = final
+	if cfg.Limits.MemoryBytes > 0 {
+		argv = append(argv, "--memory", fmt.Sprintf("%d", cfg.Limits.MemoryBytes))
+	}
+	if cfg.Limits.CPUs > 0 {
+		argv = append(argv, "--cpus", fmt.Sprintf("%g", cfg.Limits.CPUs))
+	}
+	if cfg.Limits.PidsLimit > 0 {
+		argv = append(argv, "--pids-limit", fmt.Sprintf("%d", cfg.Limits.PidsLimit))
+	}
+	argv = append(argv, cfg.Image)
+	argv = append(argv, cfg.Cmd...)
+	quoted := make([]string, 0, len(argv)+1)
+	quoted = append(quoted, shellQuote(bin))
+	for _, a := range argv {
+		quoted = append(quoted, shellQuote(a))
+	}
+	restart := "no"
+	if cfg.Restart != "" {
+		restart = cfg.Restart
+	}
+	sysRestart := "no"
+	if restart == "always" || restart == "unless-stopped" || strings.HasPrefix(restart, "on-failure") {
+		sysRestart = "always"
+	}
+	name := cfg.Name
+	if name == "" {
+		name = container.Short(cfg.ID)
+	}
+	unit := fmt.Sprintf(`[Unit]
+Description=minibox container %s
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%s
+Restart=%s
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+`, name, strings.Join(quoted, " "), sysRestart)
+	if *out == "" {
+		fmt.Print(unit)
+		return
+	}
+	if err := os.MkdirAll(*out, 0o755); err != nil {
+		die(1, "%v", err)
+	}
+	p := filepath.Join(*out, "minibox-"+name+".service")
+	if err := os.WriteFile(p, []byte(unit), 0o644); err != nil {
+		die(1, "%v", err)
+	}
+	fmt.Println(p)
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || r == '-' || r == '.' || r == '/' || r == ':' || r == '=') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// Healthcheck implements `minibox healthcheck CONTAINER`: runs the container's
+// --health-cmd inside it and reports healthy/unhealthy via exit code.
+func Healthcheck(args []string) {
+	if len(args) != 1 {
+		die(2, "usage: minibox healthcheck CONTAINER")
+	}
+	c, err := container.Resolve(args[0])
+	if err != nil {
+		die(1, "%v", err)
+	}
+	if len(c.Config.HealthCmd) == 0 {
+		die(1, "container %s has no healthcheck configured (use `minibox run --health-cmd \"CMD...\"`)", container.Short(c.Config.ID))
+	}
+	code, err := container.Exec(c, container.ExecOptions{Cmd: c.Config.HealthCmd})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "minibox: %v\n", err)
+	}
+	if code == 0 {
+		fmt.Println("healthy")
+	} else {
+		fmt.Printf("unhealthy (exit %d)\n", code)
+	}
+	os.Exit(code)
+}
+// Volume implements `minibox volume ls|create|rm|inspect|prune`.
+func Volume(args []string) {
+	if len(args) < 1 {
+		die(2, "usage: minibox volume ls|create|rm|inspect|prune ...")
+	}
+	root := state.Root()
+	switch args[0] {
+	case "ls":
+		fs := flag.NewFlagSet("volume ls", flag.ExitOnError)
+		js := fs.Bool("json", false, "output JSON")
+		fs.Parse(args[1:])
+		infos := volume.List(root)
+		if *js {
+			if infos == nil {
+				infos = []volume.Info{}
+			}
+			b, _ := json.MarshalIndent(infos, "", "  ")
+			fmt.Println(string(b))
+			return
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+		fmt.Fprintln(w, "VOLUME NAME\tMOUNTPOINT\tCREATED")
+		for _, v := range infos {
+			fmt.Fprintf(w, "%s\t%s\t%s\n", v.Name, v.Path, human(v.Created))
+		}
+		w.Flush()
+	case "create":
+		if len(args) != 2 {
+			die(2, "usage: minibox volume create NAME")
+		}
+		p, err := volume.Ensure(root, args[1])
+		if err != nil {
+			die(1, "%v", err)
+		}
+		fmt.Println(args[1] + "\t" + p)
+	case "rm":
+		if len(args) < 2 {
+			die(2, "usage: minibox volume rm NAME...")
+		}
+		inUse := volumesInUse(root)
+		rc := 0
+		for _, n := range args[1:] {
+			if id, ok := inUse[n]; ok {
+				fmt.Fprintf(os.Stderr, "minibox: volume %q is in use by container %s; remove the container first\n", n, id)
+				rc = 1
+				continue
+			}
+			if err := volume.Remove(root, n); err != nil {
+				fmt.Fprintf(os.Stderr, "minibox: %v\n", err)
+				rc = 1
+				continue
+			}
+			fmt.Println(n)
+		}
+		os.Exit(rc)
+	case "inspect":
+		if len(args) != 2 {
+			die(2, "usage: minibox volume inspect NAME")
+		}
+		infos := volume.List(root)
+		for _, v := range infos {
+			if v.Name == args[1] {
+				b, _ := json.MarshalIndent(v, "", "  ")
+				fmt.Println(string(b))
+				return
+			}
+		}
+		die(1, "no such volume %q; list volumes with `minibox volume ls`", args[1])
+	case "prune":
+		inUse := volumesInUse(root)
+		n := 0
+		for _, v := range volume.List(root) {
+			if inUse[v.Name] != "" {
+				continue
+			}
+			if err := volume.Remove(root, v.Name); err == nil {
+				n++
+			}
+		}
+		fmt.Printf("removed %d unused volume(s)\n", n)
+	default:
+		die(2, "usage: minibox volume ls|create|rm|inspect|prune ...")
+	}
+}
+
+// volumesInUse maps volume name -> short container id for volumes referenced by any container.
+func volumesInUse(root string) map[string]string {
+	out := map[string]string{}
+	vroot := volume.Dir(root)
+	for _, c := range container.List() {
+		for _, m := range c.Config.Mounts {
+			if m.Type != "bind" || m.Src == "" {
+				continue
+			}
+			rel, err := filepath.Rel(vroot, m.Src)
+			if err != nil || strings.HasPrefix(rel, "..") {
+				continue
+			}
+			name := strings.Split(rel, string(os.PathSeparator))[0]
+			if name != "" && name != "." {
+				if _, ok := out[name]; !ok {
+					out[name] = container.Short(c.Config.ID)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Rmi implements `minibox rmi IMAGE...`.
 func Rmi(args []string) {
 	if len(args) < 1 {
@@ -629,6 +980,270 @@ func Rmi(args []string) {
 	}
 	if res, err := st.GC(false); err == nil && res != nil && res.Layers > 0 {
 		fmt.Printf("Removed %d unused layer(s)\n", res.Layers)
+	}
+	os.Exit(rc)
+}
+
+// Build implements `minibox build [-t NAME] [-f Dockerfile] [--build-arg K=V] PATH`.
+func Build(args []string) {
+	fs := flag.NewFlagSet("build", flag.ExitOnError)
+	tag := fs.String("t", "", "name for the built image (e.g. myapp:1.0)")
+	fs.StringVar(tag, "tag", "", "")
+	dockerfile := fs.String("f", "", "Dockerfile to build from (default PATH/Dockerfile)")
+	fs.StringVar(dockerfile, "file", "", "")
+	var buildArgs listFlag
+	fs.Var(&buildArgs, "build-arg", "build-time variable K=V (repeatable, for ARG)")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "usage: minibox build -t NAME [-f Dockerfile] [--build-arg K=V] PATH")
+	}
+	fs.Parse(args)
+	if *tag == "" {
+		die(2, "no target name: use `minibox build -t NAME PATH`")
+	}
+	ctxDir := "."
+	if fs.NArg() > 1 {
+		die(2, "usage: minibox build -t NAME [-f Dockerfile] [--build-arg K=V] PATH")
+	}
+	if fs.NArg() == 1 {
+		ctxDir = fs.Arg(0)
+	}
+	abs, err := filepath.Abs(ctxDir)
+	if err != nil {
+		die(125, "%v", err)
+	}
+	if st, err := os.Stat(abs); err != nil || !st.IsDir() {
+		die(125, "build context %q is not a directory", ctxDir)
+	}
+	argMap := map[string]string{}
+	for _, a := range buildArgs {
+		k, v, ok := strings.Cut(a, "=")
+		if !ok || k == "" {
+			die(2, "bad --build-arg %q; use K=V", a)
+		}
+		argMap[k] = v
+	}
+	df := *dockerfile
+	if df == "" {
+		df = filepath.Join(abs, "Dockerfile")
+	}
+	img, err := build.Build(context.Background(), build.Options{
+		ContextDir: abs, Dockerfile: df, Tag: *tag, BuildArgs: argMap, Log: os.Stderr,
+	})
+	if err != nil {
+		die(1, "build: %v", err)
+	}
+	fmt.Println(img.Name)
+}
+
+// defaultComposeFile finds the compose file: -f flag or minibox.yml/minibox.yaml/compose.yml.
+func defaultComposeFile(flagVal string) (string, error) {
+	if flagVal != "" {
+		return flagVal, nil
+	}
+	for _, n := range []string{"minibox.yml", "minibox.yaml", "compose.yml", "compose.yaml"} {
+		if _, err := os.Stat(n); err == nil {
+			return n, nil
+		}
+	}
+	return "", fmt.Errorf("no compose file found; pass -f FILE or create minibox.yml")
+}
+
+// Up implements `minibox up [-f FILE] [-p PROJECT] [-d]`.
+func Up(args []string) {
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	file := fs.String("f", "", "compose file (default minibox.yml)")
+	project := fs.String("p", "", "project name (default: compose file's directory name)")
+	detach := fs.Bool("d", true, "run in background (foreground is not supported; always detached)")
+	fs.Parse(args)
+	_ = detach
+	f, err := defaultComposeFile(*file)
+	if err != nil {
+		die(1, "%v", err)
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		die(1, "read %s: %v", f, err)
+	}
+	proj, err := compose.Parse(data)
+	if err != nil {
+		die(2, "%s: %v", f, err)
+	}
+	projName := *project
+	if projName == "" {
+		abs, _ := filepath.Abs(filepath.Dir(f))
+		projName = filepath.Base(abs)
+	}
+	for _, svc := range proj.Services {
+		if err := upOne(svc, projName); err != nil {
+			die(1, "%s: %v", svc.Name, err)
+		}
+	}
+}
+
+func upOne(svc compose.Service, projName string) error {
+	name := projName + "_" + svc.Name
+	st := &image.Store{Root: state.Root()}
+	unlock, err := st.RLock()
+	if err != nil {
+		return fmt.Errorf("lock image store: %w", err)
+	}
+	img, err := st.GetImage(svc.Image)
+	if err != nil {
+		if _, perr := image.ParseReference(svc.Image); perr != nil {
+			unlock()
+			return perr
+		}
+		fmt.Fprintf(os.Stderr, "Unable to find image %q locally\n", svc.Image)
+		if img, err = st.Pull(context.Background(), image.NewClient(), svc.Image, os.Stderr); err != nil {
+			unlock()
+			return err
+		}
+	}
+	unlock()
+	cfg := container.Config{Name: name, Init: true, Detach: true}
+	cfg.Image = img.Name
+	cmd := svc.Command
+	if len(cmd) == 0 {
+		cmd = img.Config.Cmd
+	}
+	cfg.Cmd = append(append([]string(nil), img.Config.Entrypoint...), cmd...)
+	if len(cfg.Cmd) == 0 {
+		return fmt.Errorf("service %q: image %s has no default command; set `command:`", svc.Name, svc.Image)
+	}
+	env := append(append([]string(nil), img.Config.Env...), svc.Environment...)
+	// Bare KEY entries pass through the host environment.
+	for i, e := range env {
+		if !strings.Contains(e, "=") {
+			v, ok := os.LookupEnv(e)
+			if !ok {
+				return fmt.Errorf("service %q: environment variable %q is not set on the host; use KEY=VALUE", svc.Name, e)
+			}
+			env[i] = e + "=" + v
+		}
+	}
+	cfg.Env = runtime.MergeEnv(env)
+	cfg.Env = dedupEnv(cfg.Env)
+	cfg.Workdir = svc.Workdir
+	if cfg.Workdir == "" {
+		cfg.Workdir = img.Config.WorkingDir
+	}
+	cfg.User = svc.User
+	if cfg.User == "" {
+		cfg.User = img.Config.User
+	}
+	cfg.Network = svc.Network
+	if cfg.Network == "" {
+		var why string
+		if cfg.Network, why = network.DefaultMode(); why != "" {
+			fmt.Fprintln(os.Stderr, "minibox:", why)
+		}
+	}
+	switch cfg.Network {
+	case network.Bridge, network.Host, network.None, network.Pasta:
+	default:
+		return fmt.Errorf("service %q: unknown network mode %q; use bridge, host, none or pasta", svc.Name, svc.Network)
+	}
+	if cfg.Restart, err = normalizeRestart(svc.Restart); err != nil {
+		return fmt.Errorf("service %q: %w", svc.Name, err)
+	}
+	for _, p := range svc.Ports {
+		pm, err := network.ParsePort(p)
+		if err != nil {
+			return fmt.Errorf("service %q: %w", svc.Name, err)
+		}
+		cfg.Ports = append(cfg.Ports, pm)
+	}
+	for _, v := range svc.Volumes {
+		m, err := runtime.ParseVolume(v, func(vname string) (string, error) {
+			return volume.Ensure(state.Root(), vname)
+		})
+		if err != nil {
+			return fmt.Errorf("service %q: %w", svc.Name, err)
+		}
+		cfg.Mounts = append(cfg.Mounts, m)
+	}
+	if cfg.Caps, err = security.ResolveCaps(nil, nil); err != nil {
+		return err
+	}
+	cfg.Seccomp = true
+	id, err := image.NewID()
+	if err != nil {
+		return err
+	}
+	cfg.ID = id
+	if cfg.Hostname == "" {
+		cfg.Hostname = svc.Hostname
+		if cfg.Hostname == "" {
+			cfg.Hostname = id[:12]
+		}
+	}
+	c, err := container.Create(cfg)
+	if err != nil {
+		return err
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	cmd2 := exec.Command("/proc/self/exe", "shim", c.Config.ID)
+	cmd2.ExtraFiles = []*os.File{w}
+	cmd2.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd2.Start(); err != nil {
+		return fmt.Errorf("start shim: %w", err)
+	}
+	w.Close()
+	msg, _ := io.ReadAll(r)
+	if len(msg) > 0 {
+		return fmt.Errorf("%s", msg)
+	}
+	go cmd2.Wait()
+	fmt.Printf("%s  %s\n", name, c.Config.ID[:12])
+	return nil
+}
+
+// Down implements `minibox down [-f FILE] [-p PROJECT]`.
+func Down(args []string) {
+	fs := flag.NewFlagSet("down", flag.ExitOnError)
+	file := fs.String("f", "", "compose file (default minibox.yml)")
+	project := fs.String("p", "", "project name (default: compose file's directory name)")
+	fs.Parse(args)
+	f, err := defaultComposeFile(*file)
+	if err != nil {
+		die(1, "%v", err)
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		die(1, "read %s: %v", f, err)
+	}
+	proj, err := compose.Parse(data)
+	if err != nil {
+		die(2, "%s: %v", f, err)
+	}
+	projName := *project
+	if projName == "" {
+		abs, _ := filepath.Abs(filepath.Dir(f))
+		projName = filepath.Base(abs)
+	}
+	rc := 0
+	for _, svc := range proj.Services {
+		name := projName + "_" + svc.Name
+		c, err := container.Resolve(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "minibox: %s: %v\n", name, err)
+			rc = 1
+			continue
+		}
+		if err := container.Stop(c, 10*time.Second); err != nil {
+			fmt.Fprintf(os.Stderr, "minibox: %s: %v\n", name, err)
+			rc = 1
+			continue
+		}
+		if err := container.Remove(c, false); err != nil {
+			fmt.Fprintf(os.Stderr, "minibox: %s: %v\n", name, err)
+			rc = 1
+			continue
+		}
+		fmt.Println(name)
 	}
 	os.Exit(rc)
 }

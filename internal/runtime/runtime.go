@@ -46,6 +46,7 @@ type InitSpec struct {
 	User     string      // "uid[:gid]" or a name from the container's /etc/passwd
 	TTY      bool        // fd 0 is a pty slave to become the controlling terminal
 	Binds    [][2]string // [host src, container dst] file bind mounts (resolv.conf, hosts)
+	Mounts   []Mount     // -v / --tmpfs
 	Caps     []string    // capabilities to keep (nil = untouched, run-raw)
 	Seccomp  bool
 	ReadOnly bool
@@ -219,6 +220,11 @@ func Init() error {
 			return err
 		}
 	}
+	for _, m := range spec.Mounts {
+		if err := applyMount(spec.Rootfs, m); err != nil {
+			return err
+		}
+	}
 	if err := setupRootfs(spec.Rootfs); err != nil {
 		return err
 	}
@@ -277,11 +283,9 @@ func newID() (string, error) {
 // bindFile bind-mounts the host file src over rootfs+dst, creating dst if needed (a dangling
 // or absolute symlink such as /etc/resolv.conf -> /run/... is replaced in the writable layer).
 func bindFile(rootfs, src, dst string) error {
-	target := rootfs + dst
-	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-		if err := os.Remove(target); err != nil {
-			return fmt.Errorf("replace symlink %s: %w", dst, err)
-		}
+	target, err := ResolveInRoot(rootfs, dst) // never follows a symlink out of the rootfs
+	if err != nil {
+		return err
 	}
 	if _, err := os.Lstat(target); err != nil {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {

@@ -54,7 +54,7 @@ func (c *Container) initSpec() (runtime.InitSpec, error) {
 	}
 	spec.Cmd, spec.Env, spec.Workdir = cfg.Cmd, cfg.Env, cfg.Workdir
 	spec.Hostname, spec.User, spec.TTY, spec.Init = cfg.Hostname, cfg.User, cfg.TTY, cfg.Init
-	spec.Caps, spec.Seccomp, spec.ReadOnly = cfg.Caps, cfg.Seccomp, cfg.ReadOnly
+	spec.Caps, spec.Seccomp, spec.ReadOnly, spec.Mounts = cfg.Caps, cfg.Seccomp, cfg.ReadOnly, cfg.Mounts
 	return spec, nil
 }
 
