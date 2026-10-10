@@ -5,6 +5,7 @@ package image
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -264,6 +265,8 @@ func TestExtractXattrFiltering(t *testing.T) {
 	_, layer := sandbox(t)
 	ents := []ent{{name: "f", body: "x", pax: map[string]string{
 		"SCHILY.xattr.user.k":                   "v",
+		"SCHILY.xattr.user.overlay.redirect":    "/etc",
+		"SCHILY.xattr.user.overlay.whiteout":    "y",
 		"SCHILY.xattr.trusted.overlay.redirect": "/etc",
 		"SCHILY.xattr.trusted.overlay.opaque":   "y",
 	}}, {name: "d", typ: tar.TypeDir, pax: map[string]string{"SCHILY.xattr.trusted.overlay.opaque": "y"}}}
@@ -275,7 +278,7 @@ func TestExtractXattrFiltering(t *testing.T) {
 		t.Errorf("user xattr lost: %v", err)
 	}
 	for _, p := range []string{"f", "d"} {
-		for _, x := range []string{"trusted.overlay.redirect", "trusted.overlay.opaque"} {
+		for _, x := range []string{"trusted.overlay.redirect", "trusted.overlay.opaque", "user.overlay.redirect", "user.overlay.whiteout"} {
 			if _, err := unix.Getxattr(filepath.Join(layer, p), x, buf); err == nil {
 				t.Errorf("%s: smuggled xattr %s present", p, x)
 			}
@@ -350,5 +353,68 @@ func TestSplitPath(t *testing.T) {
 		if _, err := splitPath(bad); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+func TestUnprivilegedXattrWhiteout(t *testing.T) {
+	_, layer := sandbox(t)
+	data := mkTar(t, []ent{
+		{name: "etc/", typ: tar.TypeDir, mode: 0o755},
+		{name: "etc/.wh.passwd", mode: 0},
+		{name: "var/", typ: tar.TypeDir, mode: 0o755},
+		{name: "var/.wh..wh..opq", mode: 0},
+		{name: "var/.wh.gone", mode: 0}, // inside an opaque dir: redundant, must not appear
+		{name: "etc/keep", body: "x", mode: 0o644},
+	})
+	opts := ExtractOptions{OpaqueXattr: "user.overlay.opaque", Privileged: false}
+	if err := ExtractTar(layer, bytes.NewReader(data), opts); err != nil {
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skipf("filesystem without user xattrs: %v", err)
+		}
+		t.Fatal(err)
+	}
+	st, err := os.Lstat(filepath.Join(layer, "etc/passwd"))
+	if err != nil || !st.Mode().IsRegular() || st.Size() != 0 {
+		t.Fatalf("xwhiteout missing: %v %v", st, err)
+	}
+	buf := make([]byte, 8)
+	n, err := unix.Getxattr(filepath.Join(layer, "etc/passwd"), "user.overlay.whiteout", buf)
+	if err == unix.ENOTSUP || err == unix.EOPNOTSUPP {
+		t.Skip("filesystem without user xattrs")
+	}
+	if err != nil || string(buf[:n]) != "y" {
+		t.Fatalf("whiteout xattr: %q %v", buf[:n], err)
+	}
+	if n, _ := unix.Getxattr(filepath.Join(layer, "etc"), "user.overlay.opaque", buf); string(buf[:n]) != "x" {
+		t.Errorf("parent opaque marker = %q, want x", buf[:n])
+	}
+	if n, _ := unix.Getxattr(filepath.Join(layer, "var"), "user.overlay.opaque", buf); string(buf[:n]) != "y" {
+		t.Errorf("opaque dir marker = %q, want y", buf[:n])
+	}
+	if _, err := os.Lstat(filepath.Join(layer, "var/gone")); err == nil {
+		t.Error("whiteout inside an opaque dir should be skipped")
+	}
+}
+
+func TestParseRelease(t *testing.T) {
+	for in, want := range map[string][2]int{
+		"6.18.46-railway": {6, 18}, "5.4.0": {5, 4}, "6.8": {6, 8},
+		"4.19.123+": {4, 19}, "6.8.0--generic": {6, 8},
+	} {
+		maj, min, ok := parseRelease(in)
+		if !ok || maj != want[0] || min != want[1] {
+			t.Errorf("%q => %d.%d,%v", in, maj, min, ok)
+		}
+	}
+	for _, bad := range []string{"", "abc", "6", "6.x", ".8"} {
+		if _, _, ok := parseRelease(bad); ok {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if !releaseAtLeast("6.18.46", 6, 8) || releaseAtLeast("5.15.0", 6, 8) || !releaseAtLeast("7.0", 6, 8) {
+		t.Error("releaseAtLeast wrong")
+	}
+	if rel, ok := kernelRelease(); !ok || rel == "" {
+		t.Error("kernelRelease failed")
 	}
 }

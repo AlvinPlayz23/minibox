@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sys/unix"
 )
 
@@ -207,6 +208,12 @@ func (s *Store) HasLayer(chainID string) bool {
 // place atomically, so a crash never leaves a half-unpacked layer. If the
 // same layer already exists the new copy is discarded.
 func (s *Store) UnpackLayer(parent string, r io.Reader, opts ExtractOptions) (*Layer, error) {
+	return s.UnpackLayerVerified(parent, r, opts, "")
+}
+
+// UnpackLayerVerified is UnpackLayer, but if wantDiffID is set the layer is only
+// published when the uncompressed stream hashes to it.
+func (s *Store) UnpackLayerVerified(parent string, r io.Reader, opts ExtractOptions, wantDiffID string) (*Layer, error) {
 	if err := os.MkdirAll(s.layersDir(), 0o755); err != nil {
 		return nil, err
 	}
@@ -232,6 +239,9 @@ func (s *Store) UnpackLayer(parent string, r io.Reader, opts ExtractOptions) (*L
 		return nil, err
 	}
 	l := &Layer{DiffID: "sha256:" + hex.EncodeToString(h.Sum(nil)), Parent: parent}
+	if wantDiffID != "" && wantDiffID != l.DiffID {
+		return nil, fmt.Errorf("layer diffID mismatch: image config says %s but content hashes to %s (corrupted or tampered layer)", wantDiffID, l.DiffID)
+	}
 	l.ChainID = ChainID(parent, l.DiffID)
 	meta, _ := json.Marshal(l)
 	if err := os.WriteFile(filepath.Join(tmp, "meta.json"), meta, 0o644); err != nil {
@@ -313,32 +323,34 @@ type Image struct {
 	Layers  []ImageLayer `json:"layers"`
 	Config  Config       `json:"config"`
 	Created time.Time    `json:"created"`
+	Digest  string       `json:"digest,omitempty"` // manifest digest (pulled images)
+	Size    int64        `json:"size,omitempty"`   // compressed layer bytes
 }
 
 var nameRe = lazyRe(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 var tagRe = lazyRe(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 
-// localRef splits NAME[:TAG] into a store path. Full reference parsing arrives with M6.
+// imagePath maps a reference to images/<registry>/<repo>/<tag>.json and returns its canonical name.
 func (s *Store) imagePath(name string) (string, string, error) {
-	repo, tag := name, "latest"
-	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i:], "/") {
-		repo, tag = name[:i], name[i+1:]
+	ref, err := ParseReference(name)
+	if err != nil {
+		return "", "", err
 	}
-	if !nameRe().MatchString(repo) || len(repo) > 255 {
-		return "", "", fmt.Errorf("invalid image name %q; use lowercase letters, digits, '.', '_', '-' and '/' (e.g. myapp or team/app:1.0)", name)
-	}
-	if !tagRe().MatchString(tag) {
-		return "", "", fmt.Errorf("invalid tag %q in %q", tag, name)
-	}
-	for _, c := range strings.Split(repo, "/") {
+	for _, c := range strings.Split(ref.Repo, "/") {
 		if c == "." || c == ".." {
 			return "", "", fmt.Errorf("invalid image name %q", name)
 		}
 	}
-	return filepath.Join(s.Root, "images", "local", filepath.FromSlash(repo), tag+".json"), "local/" + repo + ":" + tag, nil
+	file := ref.Tag + ".json"
+	if ref.Digest != "" {
+		file = "@" + strings.Replace(ref.Digest, ":", "-", 1) + ".json"
+	}
+	host := strings.ReplaceAll(ref.Registry, ":", "_")
+	return filepath.Join(s.Root, "images", host, filepath.FromSlash(ref.Repo), file), ref.Name(), nil
 }
 
-// SaveImage writes the image record atomically.
+// SaveImage writes the image record atomically (unique temp file: concurrent
+// pulls of the same tag must not share it).
 func (s *Store) SaveImage(img *Image, name string) error {
 	p, canon, err := s.imagePath(name)
 	if err != nil {
@@ -349,20 +361,67 @@ func (s *Store) SaveImage(img *Image, name string) error {
 		return err
 	}
 	b, _ := json.MarshalIndent(img, "", "  ")
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(p), ".tmp-*.json")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// Migrate away any pre-M6 record for the same image (images/local/...):
+	// without this an upgrade strands previously loaded/built images.
+	for _, legacy := range s.legacyPaths(name) {
+		if legacy != p {
+			os.Remove(legacy)
+		}
+	}
+	return nil
 }
 
-// GetImage loads an image record by name.
+// legacyPaths returns pre-M6 record locations (images/local/...) for name.
+func (s *Store) legacyPaths(name string) []string {
+	ref, err := ParseReference(name)
+	if err != nil || ref.Registry != "docker.io" || ref.Digest != "" {
+		return nil
+	}
+	var out []string
+	for _, repo := range []string{ref.Repo, strings.TrimPrefix(ref.Repo, "library/")} {
+		out = append(out, filepath.Join(s.Root, "images", "local", filepath.FromSlash(repo), ref.Tag+".json"))
+	}
+	return out
+}
+
+// GetImage loads an image record by name, falling back to pre-M6 locations.
 func (s *Store) GetImage(name string) (*Image, error) {
 	p, _, err := s.imagePath(name)
 	if err != nil {
 		return nil, err
 	}
 	b, err := os.ReadFile(p)
+	if err != nil && os.IsNotExist(err) {
+		for _, legacy := range s.legacyPaths(name) {
+			if lb, lerr := os.ReadFile(legacy); lerr == nil {
+				b, err = lb, nil
+				break
+			}
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("image %q not found in %s; load it first with `minibox load`", name, s.Root)
@@ -386,7 +445,11 @@ func Decompress(r io.Reader) (io.Reader, error) {
 	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
 		return gzip.NewReader(br)
 	case len(magic) == 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-		return nil, errors.New("zstd-compressed tarballs are not supported yet (arrives with M6); decompress first or use gzip")
+		zr, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(256<<20))
+		if err != nil {
+			return nil, err
+		}
+		return zr.IOReadCloser(), nil
 	}
 	return br, nil
 }

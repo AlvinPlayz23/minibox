@@ -35,13 +35,22 @@ type RunOptions struct {
 	Keep   bool // keep the container dir (upper layer) after exit, for inspection
 }
 
-// initSpec is passed from the supervisor to the init stage as JSON on fd 3.
-type initSpec struct {
-	Rootfs  string
-	Overlay *storage.Overlay
-	Cmd     []string
-	Env     []string
-	Workdir string
+// InitSpec is passed from the supervisor to the init stage as JSON on fd 3.
+type InitSpec struct {
+	Rootfs   string
+	Overlay  *storage.Overlay
+	Cmd      []string
+	Env      []string
+	Workdir  string
+	Hostname string
+	User     string      // "uid[:gid]" or a name from the container's /etc/passwd
+	TTY      bool        // fd 0 is a pty slave to become the controlling terminal
+	Binds    [][2]string // [host src, container dst] file bind mounts (resolv.conf, hosts)
+	Mounts   []Mount     // -v / --tmpfs
+	Caps     []string    // capabilities to keep (nil = untouched, run-raw)
+	Seccomp  bool
+	ReadOnly bool
+	Init     bool // stay as PID 1: reap zombies, forward signals, then exit with the child's status
 }
 
 // RunRaw runs a command in new PID/mount/UTS/IPC/net namespaces on a pivot_rooted
@@ -49,7 +58,7 @@ type initSpec struct {
 // Returns the child's exit code.
 func RunRaw(o RunOptions) (int, error) {
 	lim, cmd := o.Limits, o.Cmd
-	spec := initSpec{Cmd: cmd, Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=" + os.Getenv("TERM")}}
+	spec := InitSpec{Cmd: cmd, Env: []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "TERM=" + os.Getenv("TERM")}}
 	id, err := newID()
 	if err != nil {
 		return 125, err
@@ -183,7 +192,7 @@ func mergeEnv(img []string) []string {
 // Init runs inside the new namespaces as PID 1; the spec arrives on fd 3.
 func Init() error {
 	f := os.NewFile(3, "spec")
-	var spec initSpec
+	var spec InitSpec
 	if err := json.NewDecoder(f).Decode(&spec); err != nil {
 		return fmt.Errorf("init: read spec: %w", err)
 	}
@@ -195,7 +204,10 @@ func Init() error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make / private: %w", err)
 	}
-	if err := unix.Sethostname([]byte("minibox")); err != nil {
+	if spec.Hostname == "" {
+		spec.Hostname = "minibox"
+	}
+	if err := unix.Sethostname([]byte(spec.Hostname)); err != nil {
 		return fmt.Errorf("sethostname: %w", err)
 	}
 	if spec.Overlay != nil {
@@ -203,8 +215,23 @@ func Init() error {
 			return err
 		}
 	}
+	for _, b := range spec.Binds {
+		if err := bindFile(spec.Rootfs, b[0], b[1]); err != nil {
+			return err
+		}
+	}
+	for _, m := range spec.Mounts {
+		if err := applyMount(spec.Rootfs, m); err != nil {
+			return err
+		}
+	}
 	if err := setupRootfs(spec.Rootfs); err != nil {
 		return err
+	}
+	if spec.ReadOnly {
+		if err := unix.Mount("", "/", "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("remount rootfs read-only: %w", err)
+		}
 	}
 	if spec.Workdir != "" {
 		if err := unix.Chdir(spec.Workdir); err != nil {
@@ -215,7 +242,7 @@ func Init() error {
 	if err != nil {
 		return err
 	}
-	return unix.Exec(path, spec.Cmd, spec.Env)
+	return execFinal(&spec, path)
 }
 
 func lookPath(name string, env []string) (string, error) {
@@ -253,39 +280,25 @@ func newID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// Prune removes cgroups and lock files of containers whose supervisor is gone.
-func Prune() (int, error) {
-	if err := cgroup.Check(); err != nil {
-		return 0, err
+// bindFile bind-mounts the host file src over rootfs+dst, creating dst if needed (a dangling
+// or absolute symlink such as /etc/resolv.conf -> /run/... is replaced in the writable layer).
+func bindFile(rootfs, src, dst string) error {
+	target, err := ResolveInRoot(rootfs, dst) // never follows a symlink out of the rootfs
+	if err != nil {
+		return err
 	}
-	n := 0
-	// Container dirs of dead supervisors (M5 adds persistent containers, which have state.json and are kept).
-	if ents, _ := os.ReadDir(filepath.Join(state.Root(), "containers")); ents != nil {
-		for _, e := range ents {
-			dir := filepath.Join(state.Root(), "containers", e.Name())
-			if _, err := os.Stat(filepath.Join(dir, "state.json")); err == nil || state.IsAlive(e.Name()) {
-				continue
-			}
-			if err := os.RemoveAll(dir); err != nil {
-				return n, err
-			}
-			n++
+	if _, err := os.Lstat(target); err != nil {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
 		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("create %s in container: %w", dst, err)
+		}
+		f.Close()
 	}
-	for _, id := range cgroup.List() {
-		if state.IsAlive(id) {
-			continue
-		}
-		// A cgroup with no lock file under *this* MINIBOX_ROOT may belong to another
-		// root's live container: only remove it if it is empty.
-		if !state.HasLock(id) && cgroup.HasProcs(cgroup.Base()+"/"+id) {
-			continue
-		}
-		if err := cgroup.RemovePath(cgroup.Base() + "/" + id); err != nil {
-			return n, err
-		}
-		state.Release(id, nil)
-		n++
+	if err := unix.Mount(src, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind %s onto %s: %w", src, dst, err)
 	}
-	return n, nil
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,7 +28,10 @@ type ExtractOptions struct {
 
 // DefaultExtractOptions returns options for the current process.
 func DefaultExtractOptions() ExtractOptions {
-	return ExtractOptions{OpaqueXattr: "trusted.overlay.opaque", Privileged: os.Geteuid() == 0}
+	if os.Geteuid() != 0 {
+		return ExtractOptions{OpaqueXattr: "user.overlay.opaque", Privileged: false}
+	}
+	return ExtractOptions{OpaqueXattr: "trusted.overlay.opaque", Privileged: true}
 }
 
 // ExtractTar unpacks an (uncompressed) tar stream into dir, which must exist.
@@ -376,7 +380,7 @@ func (e *extractor) whiteout(parts []string, h *tar.Header) error {
 		return fmt.Errorf("invalid whiteout name %q", name)
 	}
 	if !e.opts.Privileged {
-		return errors.New("creating overlay whiteouts needs CAP_MKNOD (rootless layers are handled in M8)")
+		return e.xwhiteout(dir, target)
 	}
 	pfd, err := e.parent(dir, true)
 	if err != nil {
@@ -393,9 +397,93 @@ func (e *extractor) whiteout(parts []string, h *tar.Header) error {
 	return err
 }
 
+// xwhiteout creates an "xattr whiteout" for unprivileged extraction (no CAP_MKNOD): an empty
+// regular file carrying user.overlay.whiteout, in a directory marked user.overlay.opaque=x
+// (overlayfs with userxattr, Linux 6.8+ "xwhiteouts"). In a directory that is already fully
+// opaque ("y") whiteouts are redundant and skipped.
+func (e *extractor) xwhiteout(dir []string, target string) error {
+	// Pre-6.8 kernels cannot interpret xattr whiteouts: the deleted lower-layer
+	// path would stay visible. Fail loudly instead of producing a corrupt layer.
+	if rel, ok := kernelRelease(); !ok || !releaseAtLeast(rel, 6, 8) {
+		return fmt.Errorf("layer deletes %s but the running kernel (%s) cannot interpret xattr whiteouts (need Linux 6.8+ for rootless overlayfs)", strings.Join(append(append([]string(nil), dir...), target), "/"), rel)
+	}
+	dfd, err := e.openDir(dir, true)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dfd)
+	buf := make([]byte, 4)
+	if n, err := unix.Fgetxattr(dfd, "user.overlay.opaque", buf); err == nil && n == 1 && buf[0] == 'y' {
+		return nil
+	}
+	_ = unix.Unlinkat(dfd, target, 0)
+	fd, err := unix.Openat(dfd, target, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if err == unix.EISDIR || err == unix.EEXIST {
+			if err = e.removeAt(dfd, append(append([]string(nil), dir...), target)); err != nil {
+				return err
+			}
+			fd, err = unix.Openat(dfd, target, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
+		if err != nil {
+			return fmt.Errorf("create xattr whiteout for %s: %w", target, err)
+		}
+	}
+	defer unix.Close(fd)
+	if err := unix.Fsetxattr(fd, "user.overlay.whiteout", []byte("y"), 0); err != nil {
+		return fmt.Errorf("mark xattr whiteout (needs a filesystem with user xattrs): %w", err)
+	}
+	return unix.Fsetxattr(dfd, "user.overlay.opaque", []byte("x"), 0)
+}
+
+// kernelRelease returns the running kernel's release string (e.g. "6.18.46").
+func kernelRelease() (string, bool) {
+	var u unix.Utsname
+	if err := unix.Uname(&u); err != nil {
+		return "", false
+	}
+	var b []byte
+	for _, c := range u.Release {
+		if c == 0 {
+			break
+		}
+		b = append(b, byte(c))
+	}
+	if len(b) == 0 {
+		return "", false
+	}
+	return string(b), true
+}
+
+// releaseAtLeast parses "major.minor..." and reports whether it is >= want.
+func releaseAtLeast(rel string, major, minor int) bool {
+	gotMajor, gotMinor, ok := parseRelease(rel)
+	return ok && (gotMajor > major || gotMajor == major && gotMinor >= minor)
+}
+
+func parseRelease(rel string) (int, int, bool) {
+	// Leading numeric prefix only; distro suffixes ("-railway", "+") are ignored.
+	i := 0
+	for i < len(rel) && (rel[i] >= '0' && rel[i] <= '9' || rel[i] == '.') {
+		i++
+	}
+	parts := strings.Split(strings.Trim(strings.Trim(rel[:i], "."), "."), ".")
+	if len(parts) < 2 {
+		return 0, 0, false
+	}
+	maj, err1 := strconv.Atoi(parts[0])
+	min, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return maj, min, true
+}
+
 // allowedXattrs keeps only xattrs that are safe in a layer: file capabilities
-// and user.*. In particular trusted.overlay.* (redirect/opaque/origin) from a
-// tar are dropped, because they could re-route overlay lookups.
+// and user.* — except user.overlay.*, which is reserved for OverlayFS itself.
+// In particular trusted.overlay.* (redirect/opaque/origin) and user.overlay.*
+// (redirect/opaque/whiteout/origin) from a tar are dropped, because they could
+// re-route overlay lookups; whiteouts come only from ".wh." entries.
 func allowedXattrs(h *tar.Header) map[string]string {
 	var out map[string]string
 	for k, v := range h.PAXRecords {
@@ -403,7 +491,8 @@ func allowedXattrs(h *tar.Header) map[string]string {
 		if !ok {
 			continue
 		}
-		if n == "security.capability" || strings.HasPrefix(n, "user.") {
+		if n == "security.capability" ||
+			(strings.HasPrefix(n, "user.") && !strings.HasPrefix(n, "user.overlay.")) {
 			if out == nil {
 				out = map[string]string{}
 			}

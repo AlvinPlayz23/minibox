@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/cli"
 	"minibox/internal/image"
 	"minibox/internal/runtime"
 	"minibox/internal/state"
@@ -21,16 +22,47 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "run":
+		cli.Run(os.Args[2:])
+	case "build":
+		cli.Build(os.Args[2:])
+	case "up":
+		cli.Up(os.Args[2:])
+	case "down":
+		cli.Down(os.Args[2:])
+	case "volume":
+		cli.Volume(os.Args[2:])
+	case "systemd":
+		cli.Systemd(os.Args[2:])
+	case "healthcheck":
+		cli.Healthcheck(os.Args[2:])
+	case "pull":
+		cli.Pull(os.Args[2:])
+	case "images":
+		cli.Images(os.Args[2:])
+	case "rmi":
+		cli.Rmi(os.Args[2:])
+	case "ps":
+		cli.Ps(os.Args[2:])
+	case "stop":
+		cli.Stop(os.Args[2:])
+	case "rm":
+		cli.Rm(os.Args[2:])
+	case "logs":
+		cli.Logs(os.Args[2:])
+	case "exec":
+		cli.Exec(os.Args[2:])
+	case "inspect":
+		cli.Inspect(os.Args[2:])
+	case "shim": // hidden: detached supervisor
+		cli.Shim(os.Args[2:])
+	case "exec-init": // hidden: exec helper
+		cli.ExecInit()
 	case "run-raw":
 		runRaw(os.Args[2:])
 	case "system":
 		if len(os.Args) == 3 && os.Args[2] == "prune" {
-			n, err := runtime.Prune()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "minibox: prune: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("removed %d stale container resource(s) (cgroups, container dirs)\n", n)
+			cli.Prune()
 			return
 		}
 		usage()
@@ -125,5 +157,5 @@ func load(args []string) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: minibox run-raw [flags] (ROOTFS CMD... | --image NAME [CMD...]) | load | system prune | version")
+	fmt.Fprintln(os.Stderr, "usage: minibox run|build|up|down|ps|images|pull|exec|logs|stop|rm|rmi|inspect|volume|systemd|healthcheck|load|system prune|version")
 }

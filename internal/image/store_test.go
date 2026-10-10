@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,10 +84,10 @@ func TestImageNameValidation(t *testing.T) {
 		}
 	}
 	p, canon, err := s.imagePath("team/app:1.0")
-	if err != nil || p != "/r/images/local/team/app/1.0.json" || canon != "local/team/app:1.0" {
+	if err != nil || p != "/r/images/docker.io/team/app/1.0.json" || canon != "docker.io/team/app:1.0" {
 		t.Errorf("%s %s %v", p, canon, err)
 	}
-	if _, canon, _ := s.imagePath("alpine"); canon != "local/alpine:latest" {
+	if _, canon, _ := s.imagePath("alpine"); canon != "docker.io/library/alpine:latest" {
 		t.Error(canon)
 	}
 }
@@ -213,5 +214,34 @@ func TestUnpackLayerConcurrentSame(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Errorf("temp dir left: %s", e.Name())
 		}
+	}
+}
+
+func TestLegacyImageLookup(t *testing.T) {
+	s := &Store{Root: t.TempDir()}
+	// Simulate a pre-M6 record: images/local/<name>/<tag>.json.
+	legacy := s.Root + "/images/local/alpine/latest.json"
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rec := &Image{Name: "local/alpine:latest", Config: Config{Cmd: []string{"/bin/sh"}}}
+	b, _ := json.Marshal(rec)
+	if err := os.WriteFile(legacy, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// New canonical lookup finds it...
+	got, err := s.GetImage("alpine")
+	if err != nil || got.Config.Cmd[0] != "/bin/sh" {
+		t.Fatalf("legacy lookup: %v %+v", err, got)
+	}
+	// ...and saving under the new layout migrates the old record away.
+	if err := s.SaveImage(&Image{Config: Config{Cmd: []string{"/bin/sh"}}}, "alpine"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Error("legacy record not migrated")
+	}
+	if _, err := s.RemoveImage("alpine"); err != nil {
+		t.Fatal(err)
 	}
 }
