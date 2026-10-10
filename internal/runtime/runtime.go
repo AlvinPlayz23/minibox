@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -42,9 +43,10 @@ type InitSpec struct {
 	Env      []string
 	Workdir  string
 	Hostname string
-	User     string // "uid[:gid]" or a name from the container's /etc/passwd
-	TTY      bool   // fd 0 is a pty slave to become the controlling terminal
-	Init     bool   // stay as PID 1: reap zombies, forward signals, then exit with the child's status
+	User     string      // "uid[:gid]" or a name from the container's /etc/passwd
+	TTY      bool        // fd 0 is a pty slave to become the controlling terminal
+	Binds    [][2]string // [host src, container dst] file bind mounts (resolv.conf, hosts)
+	Init     bool        // stay as PID 1: reap zombies, forward signals, then exit with the child's status
 }
 
 // RunRaw runs a command in new PID/mount/UTS/IPC/net namespaces on a pivot_rooted
@@ -209,6 +211,11 @@ func Init() error {
 			return err
 		}
 	}
+	for _, b := range spec.Binds {
+		if err := bindFile(spec.Rootfs, b[0], b[1]); err != nil {
+			return err
+		}
+	}
 	if err := setupRootfs(spec.Rootfs); err != nil {
 		return err
 	}
@@ -257,4 +264,29 @@ func newID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// bindFile bind-mounts the host file src over rootfs+dst, creating dst if needed (a dangling
+// or absolute symlink such as /etc/resolv.conf -> /run/... is replaced in the writable layer).
+func bindFile(rootfs, src, dst string) error {
+	target := rootfs + dst
+	if fi, err := os.Lstat(target); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if err := os.Remove(target); err != nil {
+			return fmt.Errorf("replace symlink %s: %w", dst, err)
+		}
+	}
+	if _, err := os.Lstat(target); err != nil {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("create %s in container: %w", dst, err)
+		}
+		f.Close()
+	}
+	if err := unix.Mount(src, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind %s onto %s: %w", src, dst, err)
+	}
+	return nil
 }

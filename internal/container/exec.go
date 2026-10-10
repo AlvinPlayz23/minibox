@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/network"
 	"minibox/internal/pty"
 	"minibox/internal/runtime"
 	"minibox/internal/state"
@@ -155,6 +156,18 @@ func Prune() (int, error) {
 				return n, err
 			}
 			n++
+		}
+	}
+	// Leases and published ports of containers that no longer exist.
+	keep := map[string]bool{}
+	for _, c := range List() {
+		if c.State.Status == "running" || c.State.Status == "created" {
+			keep[c.Config.ID] = true
+		}
+	}
+	if ipam, err := (&network.Manager{Root: state.Root()}).IPAMForPrune(); err == nil {
+		if k, _ := ipam.ReleaseExcept(keep); k > 0 {
+			n += k
 		}
 	}
 	for _, id := range cgroup.List() {

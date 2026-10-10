@@ -3,6 +3,7 @@
 package container
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"minibox/internal/cgroup"
 	"minibox/internal/image"
+	"minibox/internal/network"
 	"minibox/internal/pty"
 	"minibox/internal/runtime"
 	"minibox/internal/state"
@@ -148,7 +150,11 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		out, errf = os.Stdout, os.Stderr
 	}
 
-	cmd, err := runtime.Spawn(spec, cg, in, out, errf)
+	mode0 := c.Config.Network
+	if mode0 == "" {
+		mode0 = network.None
+	}
+	cmd, send, err := runtime.Spawn(cg, mode0 == network.Host, in, out, errf)
 	for _, f := range closeAfterStart {
 		f.Close()
 	}
@@ -158,6 +164,33 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		}
 		return fail(err)
 	}
+	// The init stage is blocked waiting for its spec: set up networking from outside first.
+	t0 := time.Now()
+	info, nerr := (&network.Manager{Root: state.Root()}).Setup(id, cmd.Process.Pid, mode0, c.Config.Ports)
+	if nerr == nil {
+		var binds [][2]string
+		if binds, nerr = network.WriteFiles(Dir(id), c.Config.Hostname, info); nerr == nil {
+			spec.Binds = binds
+		}
+	}
+	if info != nil {
+		if b, e := json.Marshal(info); e == nil {
+			os.WriteFile(netPath(id), b, 0o644)
+		}
+	}
+	defer cleanupNetwork(id)
+	if nerr != nil {
+		_ = cmd.Process.Kill()
+		cmd.Wait()
+		if master != nil {
+			master.Close()
+		}
+		return fail(fmt.Errorf("network setup (%s): %w", mode0, nerr))
+	}
+	if os.Getenv("MINIBOX_TRACE") != "" {
+		fmt.Fprintf(os.Stderr, "minibox: trace: network setup (%s) took %v\n", mode0, time.Since(t0))
+	}
+	send(spec)
 
 	var restore func()
 	if master != nil && mode == Foreground {
@@ -230,6 +263,7 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 			<-d
 		}
 	}
+	cleanupNetwork(id) // before a --rm removal deletes net.json
 	oom := cg.MemoryEvents().OOMKill > 0
 	if oom && mode == Foreground {
 		fmt.Fprintf(os.Stderr, "minibox: container was OOM-killed (memory limit %d bytes); raise --memory\n", c.Config.Limits.MemoryBytes)

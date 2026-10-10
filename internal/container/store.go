@@ -16,27 +16,30 @@ import (
 	"golang.org/x/sys/unix"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/network"
 	"minibox/internal/state"
 )
 
 // Config is the resolved, immutable runtime configuration (config.json).
 type Config struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name,omitempty"`
-	Image       string        `json:"image,omitempty"`
-	Rootfs      string        `json:"rootfs,omitempty"` // plain-directory rootfs (dev; no image)
-	Cmd         []string      `json:"cmd"`
-	Env         []string      `json:"env"`
-	Workdir     string        `json:"workdir,omitempty"`
-	Hostname    string        `json:"hostname"`
-	User        string        `json:"user,omitempty"`
-	TTY         bool          `json:"tty,omitempty"`
-	Interactive bool          `json:"interactive,omitempty"`
-	Init        bool          `json:"init"`
-	Rm          bool          `json:"rm,omitempty"`
-	Detach      bool          `json:"detach,omitempty"`
-	Limits      cgroup.Limits `json:"limits"`
-	Created     time.Time     `json:"created"`
+	ID          string         `json:"id"`
+	Name        string         `json:"name,omitempty"`
+	Image       string         `json:"image,omitempty"`
+	Rootfs      string         `json:"rootfs,omitempty"` // plain-directory rootfs (dev; no image)
+	Cmd         []string       `json:"cmd"`
+	Env         []string       `json:"env"`
+	Workdir     string         `json:"workdir,omitempty"`
+	Hostname    string         `json:"hostname"`
+	User        string         `json:"user,omitempty"`
+	TTY         bool           `json:"tty,omitempty"`
+	Interactive bool           `json:"interactive,omitempty"`
+	Init        bool           `json:"init"`
+	Rm          bool           `json:"rm,omitempty"`
+	Detach      bool           `json:"detach,omitempty"`
+	Network     string         `json:"network"` // bridge, host, none, pasta
+	Ports       []network.Port `json:"ports,omitempty"`
+	Limits      cgroup.Limits  `json:"limits"`
+	Created     time.Time      `json:"created"`
 }
 
 // State is the mutable container state (state.json).
@@ -252,12 +255,28 @@ func (c *Container) Running() bool { return c.DisplayStatus() == "running" }
 
 // Reconcile finalises containers whose supervisor died: state becomes exited(137),
 // the cgroup is removed and --rm containers are deleted. Returns true if it changed anything.
+func netPath(id string) string { return filepath.Join(Dir(id), "net.json") }
+
+// cleanupNetwork undoes recorded network setup (idempotent).
+func cleanupNetwork(id string) {
+	b, err := os.ReadFile(netPath(id))
+	if err != nil {
+		return
+	}
+	var info network.Info
+	if json.Unmarshal(b, &info) == nil {
+		(&network.Manager{Root: state.Root()}).Cleanup(id, &info)
+	}
+	os.Remove(netPath(id))
+}
+
 func (c *Container) Reconcile() bool {
 	st := c.DisplayStatus()
 	if st != "dead" && !(st == "created" && !state.IsAlive(c.Config.ID) && time.Since(c.Config.Created) > 30*time.Second) {
 		return false
 	}
 	_ = cgroup.RemovePath(cgroup.Base() + "/" + c.Config.ID)
+	cleanupNetwork(c.Config.ID)
 	state.Release(c.Config.ID, nil)
 	_ = c.UpdateState(func(s *State) {
 		s.Status, s.Pid, s.ExitCode = "exited", 0, 137
@@ -283,6 +302,7 @@ func Remove(c *Container, force bool) error {
 		}
 	}
 	_ = cgroup.RemovePath(cgroup.Base() + "/" + c.Config.ID)
+	cleanupNetwork(c.Config.ID)
 	state.Release(c.Config.ID, nil)
 	return os.RemoveAll(Dir(c.Config.ID))
 }

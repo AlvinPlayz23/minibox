@@ -21,6 +21,7 @@ import (
 	"minibox/internal/cgroup"
 	"minibox/internal/container"
 	"minibox/internal/image"
+	"minibox/internal/network"
 	"minibox/internal/runtime"
 	"minibox/internal/state"
 )
@@ -86,7 +87,7 @@ func exitCode(err error) int {
 // Run implements `minibox run [flags] IMAGE [CMD...]`.
 func Run(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	var env listFlag
+	var env, pubs listFlag
 	detach := fs.Bool("d", false, "run in the background and print the container id")
 	fs.BoolVar(detach, "detach", false, "")
 	rm := fs.Bool("rm", false, "remove the container when it exits")
@@ -100,14 +101,17 @@ func Run(args []string) {
 	cpus := fs.Float64("cpus", 0, "CPU limit, e.g. 0.5")
 	pids := fs.Int64("pids-limit", 0, "max number of processes")
 	host := fs.String("hostname", "", "container hostname (default: short container id)")
+	fs.Var(&pubs, "p", "publish a port HOST:CONTAINER[/udp] (repeatable)")
+	netw := fs.String("network", "", "network mode: bridge (default as root), host, none, pasta")
 	initF := fs.Bool("init", true, "run a tiny init as PID 1 (reaps zombies, forwards signals)")
 	rootfs := fs.String("rootfs", "", "run a plain directory rootfs instead of an image (dev)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `usage: minibox run [flags] IMAGE [CMD...]
   -d/--detach  --rm  --name NAME  -i  -t  (-it)  -e KEY=VAL  -w DIR  -u USER
+  -p HOST:CONT[/udp]  --network bridge|host|none|pasta
   --memory 64m  --cpus 0.5  --pids-limit N  --hostname NAME  --init=false  --rootfs DIR`)
 	}
-	fs.Parse(expandShort(args, "dit", "e", "w", "u", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
+	fs.Parse(expandShort(args, "dit", "e", "p", "w", "u", "network", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
 	if fs.NArg() < 1 && *rootfs == "" {
 		fs.Usage()
 		os.Exit(2)
@@ -169,6 +173,20 @@ func Run(args []string) {
 		cfg.Limits.MemoryBytes = b
 	}
 	cfg.Limits.CPUs, cfg.Limits.PidsLimit = *cpus, *pids
+	cfg.Network = *netw
+	if cfg.Network == "" {
+		var why string
+		if cfg.Network, why = network.DefaultMode(); why != "" {
+			fmt.Fprintln(os.Stderr, "minibox:", why)
+		}
+	}
+	for _, p := range pubs {
+		pm, err := network.ParsePort(p)
+		if err != nil {
+			die(2, "%v", err)
+		}
+		cfg.Ports = append(cfg.Ports, pm)
+	}
 	id, err := image.NewID()
 	if err != nil {
 		die(125, "%v", err)
