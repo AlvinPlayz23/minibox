@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"minibox/internal/cgroup"
+	"minibox/internal/cli"
 	"minibox/internal/image"
 	"minibox/internal/runtime"
 	"minibox/internal/state"
@@ -21,16 +22,29 @@ func main() {
 		os.Exit(2)
 	}
 	switch os.Args[1] {
+	case "run":
+		cli.Run(os.Args[2:])
+	case "ps":
+		cli.Ps(os.Args[2:])
+	case "stop":
+		cli.Stop(os.Args[2:])
+	case "rm":
+		cli.Rm(os.Args[2:])
+	case "logs":
+		cli.Logs(os.Args[2:])
+	case "exec":
+		cli.Exec(os.Args[2:])
+	case "inspect":
+		cli.Inspect(os.Args[2:])
+	case "shim": // hidden: detached supervisor
+		cli.Shim(os.Args[2:])
+	case "exec-init": // hidden: exec helper
+		cli.ExecInit()
 	case "run-raw":
 		runRaw(os.Args[2:])
 	case "system":
 		if len(os.Args) == 3 && os.Args[2] == "prune" {
-			n, err := runtime.Prune()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "minibox: prune: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("removed %d stale container resource(s) (cgroups, container dirs)\n", n)
+			cli.Prune()
 			return
 		}
 		usage()
