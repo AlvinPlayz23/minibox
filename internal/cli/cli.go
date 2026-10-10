@@ -18,8 +18,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"minibox/internal/cgroup"
 	"minibox/internal/build"
+	"minibox/internal/cgroup"
 	"minibox/internal/compose"
 	"minibox/internal/container"
 	"minibox/internal/image"
@@ -841,6 +841,7 @@ func Healthcheck(args []string) {
 	}
 	os.Exit(code)
 }
+
 // Volume implements `minibox volume ls|create|rm|inspect|prune`.
 func Volume(args []string) {
 	if len(args) < 1 {

@@ -4,3 +4,4 @@ rootfs/
 .cursor/
 AGENTS.md
 index.html
+session-*.html

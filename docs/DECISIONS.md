@@ -15,3 +15,10 @@
 - PID 1 in the container ignores SIGTERM/SIGINT unless it installs handlers (kernel rule). Supervisor forwards signals; `stop` escalation and `--init` are M5.
 - `/proc/self/mountinfo` inside the container shows host paths (rootfs / overlay options). Information leak, not an escape; may be masked later.
 - Container still runs with full root capabilities and no seccomp until M8.
+- M5: exec joins namespaces via chroot(/proc/PID/root), not setns(mnt) — impossible from multithreaded Go; pre-warm OS threads because clone(CLONE_THREAD) fails with EINVAL inside a new pid ns.
+- M5: `--init` defaults on (~+8 ms/run) for correct signal/zombie behavior; `--init=false` for the fastest path.
+- M6: custom stdlib registry client instead of go-containerregistry (binary size/startup; PLAN §11.3 answered: yes, replaced). New dep github.com/klauspost/compress (zstd layers; pure Go, no cgo).
+- M7: netlink via github.com/vishvananda/netlink (raw netlink for veth/bridge/routes is too much hand-rolled code); nftables driven through the `nft` binary behind a Firewall interface (replaceable with netlink-native later). Own `ip minibox` table + hostports map so other tables are never touched.
+- M8: seccomp filter hand-encoded cBPF (no golang.org/x/net/bpf dependency needed — barely 120 instructions); syscall numbers code-generated from x/sys per arch (amd64/arm64).
+- M9: no YAML dependency — hand-rolled Compose-subset parser (services/image/command/ports/environment/volumes/network/restart/working_dir/user/hostname). No BuildKit — direct RUN-in-container layer capture. Volumes under MINIBOX_ROOT, never touched by `system prune`.
+- M10: no runtime tuning knobs added (GOGC etc.) — all targets already met; strace audit found no removable hot-path syscalls.
