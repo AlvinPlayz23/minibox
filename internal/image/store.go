@@ -349,7 +349,8 @@ func (s *Store) imagePath(name string) (string, string, error) {
 	return filepath.Join(s.Root, "images", host, filepath.FromSlash(ref.Repo), file), ref.Name(), nil
 }
 
-// SaveImage writes the image record atomically.
+// SaveImage writes the image record atomically (unique temp file: concurrent
+// pulls of the same tag must not share it).
 func (s *Store) SaveImage(img *Image, name string) error {
 	p, canon, err := s.imagePath(name)
 	if err != nil {
@@ -360,20 +361,67 @@ func (s *Store) SaveImage(img *Image, name string) error {
 		return err
 	}
 	b, _ := json.MarshalIndent(img, "", "  ")
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.CreateTemp(filepath.Dir(p), ".tmp-*.json")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	// Migrate away any pre-M6 record for the same image (images/local/...):
+	// without this an upgrade strands previously loaded/built images.
+	for _, legacy := range s.legacyPaths(name) {
+		if legacy != p {
+			os.Remove(legacy)
+		}
+	}
+	return nil
 }
 
-// GetImage loads an image record by name.
+// legacyPaths returns pre-M6 record locations (images/local/...) for name.
+func (s *Store) legacyPaths(name string) []string {
+	ref, err := ParseReference(name)
+	if err != nil || ref.Registry != "docker.io" || ref.Digest != "" {
+		return nil
+	}
+	var out []string
+	for _, repo := range []string{ref.Repo, strings.TrimPrefix(ref.Repo, "library/")} {
+		out = append(out, filepath.Join(s.Root, "images", "local", filepath.FromSlash(repo), ref.Tag+".json"))
+	}
+	return out
+}
+
+// GetImage loads an image record by name, falling back to pre-M6 locations.
 func (s *Store) GetImage(name string) (*Image, error) {
 	p, _, err := s.imagePath(name)
 	if err != nil {
 		return nil, err
 	}
 	b, err := os.ReadFile(p)
+	if err != nil && os.IsNotExist(err) {
+		for _, legacy := range s.legacyPaths(name) {
+			if lb, lerr := os.ReadFile(legacy); lerr == nil {
+				b, err = lb, nil
+				break
+			}
+		}
+	}
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("image %q not found in %s; load it first with `minibox load`", name, s.Root)

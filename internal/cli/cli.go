@@ -205,6 +205,12 @@ func Run(args []string) {
 			die(2, "--health-cmd is empty")
 		}
 	}
+	// Serialize with `volume rm` across Ensure below and Create: otherwise rm
+	// can pass its in-use check in between and delete the mount source.
+	volUnlock, err := volume.Lock(state.Root())
+	if err != nil {
+		die(125, "lock volumes: %v", err)
+	}
 	for _, v := range vols {
 		m, err := runtime.ParseVolume(v, func(name string) (string, error) {
 			return volume.Ensure(state.Root(), name)
@@ -249,6 +255,7 @@ func Run(args []string) {
 		cfg.Hostname = id[:12]
 	}
 	c, err := container.Create(cfg)
+	volUnlock()
 	if err != nil {
 		die(125, "%v", err)
 	}
@@ -728,22 +735,15 @@ func Systemd(args []string) {
 	if !cfg.Seccomp {
 		argv = append(argv, "--seccomp", "unconfined")
 	}
-	if len(cfg.Caps) > 0 {
-		argv = append(argv, "--cap-drop", "ALL", "--cap-add", strings.Join(cfg.Caps, ","))
-	}
-	// Fix up the cap-add above: emit one flag per capability.
-	var final []string
-	for i := 0; i < len(argv); i++ {
-		if argv[i] == "--cap-add" && i+1 < len(argv) {
-			for _, cp := range strings.Split(argv[i+1], ",") {
-				final = append(final, "--cap-add", cp)
-			}
-			i++
-			continue
+	// Caps are stored resolved (never nil for `run`-created containers): emit
+	// flags whenever they differ from the default — including the empty
+	// drop-all set, which must round-trip as --cap-drop ALL.
+	if cfg.Caps != nil && !equalCaps(cfg.Caps, security.DefaultCaps) {
+		argv = append(argv, "--cap-drop", "ALL")
+		for _, cp := range cfg.Caps {
+			argv = append(argv, "--cap-add", cp)
 		}
-		final = append(final, argv[i])
 	}
-	argv = final
 	if cfg.Limits.MemoryBytes > 0 {
 		argv = append(argv, "--memory", fmt.Sprintf("%d", cfg.Limits.MemoryBytes))
 	}
@@ -753,8 +753,16 @@ func Systemd(args []string) {
 	if cfg.Limits.PidsLimit > 0 {
 		argv = append(argv, "--pids-limit", fmt.Sprintf("%d", cfg.Limits.PidsLimit))
 	}
-	argv = append(argv, cfg.Image)
-	argv = append(argv, cfg.Cmd...)
+	if cfg.Rootfs != "" {
+		// Plain-directory containers have no image: re-run from the rootfs.
+		argv = append(argv, "--rootfs", cfg.Rootfs)
+		argv = append(argv, cfg.Cmd...)
+	} else {
+		// cfg.Cmd already has the image entrypoint prepended (see Run): emit
+		// only the original CMD tail, or the unit would run the entrypoint twice.
+		argv = append(argv, cfg.Image)
+		argv = append(argv, stripEntrypoint(cfg.Image, cfg.Cmd)...)
+	}
 	quoted := make([]string, 0, len(argv)+1)
 	quoted = append(quoted, shellQuote(bin))
 	for _, a := range argv {
@@ -797,6 +805,42 @@ WantedBy=multi-user.target
 		die(1, "%v", err)
 	}
 	fmt.Println(p)
+}
+
+// equalCaps reports whether two capability sets hold the same names.
+func equalCaps(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	in := map[string]int{}
+	for _, c := range a {
+		in[c]++
+	}
+	for _, c := range b {
+		if in[c] == 0 {
+			return false
+		}
+		in[c]--
+	}
+	return true
+}
+
+// stripEntrypoint removes the image's entrypoint prefix from a stored command:
+// Run saves entrypoint+CMD merged in config.json, and a regenerated `run`
+// would prepend the entrypoint a second time. If the image is gone, the full
+// command is returned (best effort: entrypoint duplication is possible).
+func stripEntrypoint(img string, cmd []string) []string {
+	st := &image.Store{Root: state.Root()}
+	rec, err := st.GetImage(img)
+	if err != nil || len(rec.Config.Entrypoint) == 0 || len(cmd) < len(rec.Config.Entrypoint) {
+		return cmd
+	}
+	for i, e := range rec.Config.Entrypoint {
+		if cmd[i] != e {
+			return cmd
+		}
+	}
+	return cmd[len(rec.Config.Entrypoint):]
 }
 
 func shellQuote(s string) string {
@@ -853,7 +897,10 @@ func Volume(args []string) {
 		fs := flag.NewFlagSet("volume ls", flag.ExitOnError)
 		js := fs.Bool("json", false, "output JSON")
 		fs.Parse(args[1:])
-		infos := volume.List(root)
+		infos, err := volume.List(root)
+		if err != nil {
+			die(1, "%v", err)
+		}
 		if *js {
 			if infos == nil {
 				infos = []volume.Info{}
@@ -881,6 +928,13 @@ func Volume(args []string) {
 		if len(args) < 2 {
 			die(2, "usage: minibox volume rm NAME...")
 		}
+		// Serialize with volume creation/container registration so the
+		// in-use check below cannot race a concurrent `run -v`.
+		volUnlock, err := volume.Lock(root)
+		if err != nil {
+			die(1, "lock volumes: %v", err)
+		}
+		defer volUnlock()
 		inUse := volumesInUse(root)
 		rc := 0
 		for _, n := range args[1:] {
@@ -901,7 +955,10 @@ func Volume(args []string) {
 		if len(args) != 2 {
 			die(2, "usage: minibox volume inspect NAME")
 		}
-		infos := volume.List(root)
+		infos, err := volume.List(root)
+		if err != nil {
+			die(1, "%v", err)
+		}
 		for _, v := range infos {
 			if v.Name == args[1] {
 				b, _ := json.MarshalIndent(v, "", "  ")
@@ -911,9 +968,18 @@ func Volume(args []string) {
 		}
 		die(1, "no such volume %q; list volumes with `minibox volume ls`", args[1])
 	case "prune":
+		volUnlock, err := volume.Lock(root)
+		if err != nil {
+			die(1, "lock volumes: %v", err)
+		}
+		defer volUnlock()
 		inUse := volumesInUse(root)
 		n := 0
-		for _, v := range volume.List(root) {
+		infos, err := volume.List(root)
+		if err != nil {
+			die(1, "%v", err)
+		}
+		for _, v := range infos {
 			if inUse[v.Name] != "" {
 				continue
 			}
@@ -1154,21 +1220,31 @@ func upOne(svc compose.Service, projName string) error {
 		}
 		cfg.Ports = append(cfg.Ports, pm)
 	}
+	// Serialize with `volume rm` across volume creation (Ensure below) and
+	// container registration (Create): otherwise rm can pass its in-use check
+	// in between and delete the mount source.
+	volUnlock, err := volume.Lock(state.Root())
+	if err != nil {
+		return fmt.Errorf("lock volumes: %w", err)
+	}
 	for _, v := range svc.Volumes {
 		m, err := runtime.ParseVolume(v, func(vname string) (string, error) {
 			return volume.Ensure(state.Root(), vname)
 		})
 		if err != nil {
+			volUnlock()
 			return fmt.Errorf("service %q: %w", svc.Name, err)
 		}
 		cfg.Mounts = append(cfg.Mounts, m)
 	}
 	if cfg.Caps, err = security.ResolveCaps(nil, nil); err != nil {
+		volUnlock()
 		return err
 	}
 	cfg.Seccomp = true
 	id, err := image.NewID()
 	if err != nil {
+		volUnlock()
 		return err
 	}
 	cfg.ID = id
@@ -1179,6 +1255,7 @@ func upOne(svc compose.Service, projName string) error {
 		}
 	}
 	c, err := container.Create(cfg)
+	volUnlock()
 	if err != nil {
 		return err
 	}

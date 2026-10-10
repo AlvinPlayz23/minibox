@@ -42,12 +42,38 @@ services:
 	if web.Image != "alpine" || len(web.Ports) != 1 || len(web.Environment) != 2 || web.Workdir != "/srv" || web.User != "1000" {
 		t.Errorf("%+v", web)
 	}
+	if len(web.Volumes) != 1 || web.Volumes[0] != "data:/data" {
+		t.Errorf("volumes: %q", web.Volumes)
+	}
+	if web.Network != "bridge" || web.Restart != "always" || web.Hostname != "web" {
+		t.Errorf("network/restart/hostname: %+v", web)
+	}
 	if len(web.Command) != 3 || web.Command[0] != "sh" {
 		t.Errorf("command: %q", web.Command)
 	}
 	db := p.Services[1]
 	if len(db.Command) != 3 || db.Environment[0] != "POSTGRES_PASSWORD=secret" {
 		t.Errorf("%+v", db)
+	}
+}
+
+func TestParseCommandInlineList(t *testing.T) {
+	p, err := Parse([]byte(`services:
+  a:
+    image: alpine
+    command: [sh, -c, echo hi]
+  b:
+    image: alpine
+    command: sh -c 'echo hi'
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := p.Services[0].Command; len(got) != 3 || got[0] != "sh" || got[1] != "-c" || got[2] != "echo hi" {
+		t.Errorf("inline list: %q", got)
+	}
+	if got := p.Services[1].Command; len(got) != 3 || got[2] != "echo hi" {
+		t.Errorf("string form: %q", got)
 	}
 }
 

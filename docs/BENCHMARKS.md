@@ -64,20 +64,25 @@ Binary 8.3 MB.
 ## M9 (volumes/build/compose)
 No hot-path change (mounts only when `-v`/`--tmpfs` given). Binary 8.5 MB.
 
-## M10 final (hyperfine, 6.18 kernel, this VM)
+## M10 final (hyperfine via `bench/compare.sh alpine true`, 6.18 kernel, this VM)
 
-`bench/compare.sh alpine true` (RUNS=10, `-N`):
+`compare.sh` measures process startup only: `--network none` for every runtime
+(minibox, `docker --network none`, `podman --network none` when installed),
+runc with the requested CMD written into the bundle. Typical result
+(RUNS=10, noisy shared VM — re-run on your machine):
 
 | runtime | mean [ms] | min [ms] | relative |
 |---|---|---:|---:|
-| minibox (`run --rm --network none alpine true`) | 25.7 ± 4.8 | 19.3 | 1.00 |
-| runc (minimal bundle) | 42.9 ± 11.3 | 28.3 | 1.67 |
-| docker (`docker run --rm alpine true`) | 567.0 ± 103.4 | 457.8 | 22.10 |
+| minibox (`run --rm --network none alpine true`) | ~26–36 | ~15–24 | 1.00 |
+| runc (minimal bundle, same `true`) | ~43–75 | ~28–49 | ~1.7–2.1x |
+| docker (`docker run --rm --network none alpine true`) | ~370–570 | ~310–460 | ~10–22x |
 
-Targets check: warm no-net ~26–31 ms mean (<50 ms ✓); warm bridge ~88 ms mean (<150 ms ✓);
+Targets check: warm no-net ~26–36 ms mean (<50 ms ✓); warm bridge ~88 ms mean (<150 ms ✓);
 idle RAM 0 ✓; shim VmHWM 3.8 MB (<5 MB ✓); binary 8.5 MB (<15 MB ✓);
-pull postgres:16 peak RSS 16 MB (streaming ✓). Podman not installed here — `compare.sh`
-covers it automatically when present. Hot-path audit (`strace -c -f`): ~1790 syscalls/run,
+pull postgres:16 peak RSS 16 MB (streaming ✓). Podman is covered by `compare.sh`
+automatically when installed (absent here). Hot-path audit (`strace -c -f`): ~1790 syscalls/run,
 dominated by Go runtime init in the 3 processes (CLI, init re-exec, init fork); container work
 is 22 mounts, 6 mknods, 1 pivot_root, 33 prctl, 1 seccomp install — nothing removable without
-dropping features, so no tuning knobs were added.
+dropping features, so no tuning knobs were added. Review follow-ups: the forward chain
+policy is now drop (with bridge allows), and `MINIBOX_SUBNET` changes are reconciled
+into the persistent table.

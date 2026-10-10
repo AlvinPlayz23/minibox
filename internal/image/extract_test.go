@@ -5,6 +5,7 @@ package image
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -264,6 +265,8 @@ func TestExtractXattrFiltering(t *testing.T) {
 	_, layer := sandbox(t)
 	ents := []ent{{name: "f", body: "x", pax: map[string]string{
 		"SCHILY.xattr.user.k":                   "v",
+		"SCHILY.xattr.user.overlay.redirect":    "/etc",
+		"SCHILY.xattr.user.overlay.whiteout":    "y",
 		"SCHILY.xattr.trusted.overlay.redirect": "/etc",
 		"SCHILY.xattr.trusted.overlay.opaque":   "y",
 	}}, {name: "d", typ: tar.TypeDir, pax: map[string]string{"SCHILY.xattr.trusted.overlay.opaque": "y"}}}
@@ -275,7 +278,7 @@ func TestExtractXattrFiltering(t *testing.T) {
 		t.Errorf("user xattr lost: %v", err)
 	}
 	for _, p := range []string{"f", "d"} {
-		for _, x := range []string{"trusted.overlay.redirect", "trusted.overlay.opaque"} {
+		for _, x := range []string{"trusted.overlay.redirect", "trusted.overlay.opaque", "user.overlay.redirect", "user.overlay.whiteout"} {
 			if _, err := unix.Getxattr(filepath.Join(layer, p), x, buf); err == nil {
 				t.Errorf("%s: smuggled xattr %s present", p, x)
 			}
@@ -365,6 +368,9 @@ func TestUnprivilegedXattrWhiteout(t *testing.T) {
 	})
 	opts := ExtractOptions{OpaqueXattr: "user.overlay.opaque", Privileged: false}
 	if err := ExtractTar(layer, bytes.NewReader(data), opts); err != nil {
+		if errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skipf("filesystem without user xattrs: %v", err)
+		}
 		t.Fatal(err)
 	}
 	st, err := os.Lstat(filepath.Join(layer, "etc/passwd"))
@@ -387,5 +393,28 @@ func TestUnprivilegedXattrWhiteout(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(layer, "var/gone")); err == nil {
 		t.Error("whiteout inside an opaque dir should be skipped")
+	}
+}
+
+func TestParseRelease(t *testing.T) {
+	for in, want := range map[string][2]int{
+		"6.18.46-railway": {6, 18}, "5.4.0": {5, 4}, "6.8": {6, 8},
+		"4.19.123+": {4, 19}, "6.8.0--generic": {6, 8},
+	} {
+		maj, min, ok := parseRelease(in)
+		if !ok || maj != want[0] || min != want[1] {
+			t.Errorf("%q => %d.%d,%v", in, maj, min, ok)
+		}
+	}
+	for _, bad := range []string{"", "abc", "6", "6.x", ".8"} {
+		if _, _, ok := parseRelease(bad); ok {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if !releaseAtLeast("6.18.46", 6, 8) || releaseAtLeast("5.15.0", 6, 8) || !releaseAtLeast("7.0", 6, 8) {
+		t.Error("releaseAtLeast wrong")
+	}
+	if rel, ok := kernelRelease(); !ok || rel == "" {
+		t.Error("kernelRelease failed")
 	}
 }

@@ -5,6 +5,7 @@ package runtime
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -50,6 +51,53 @@ func TestResolveInRoot(t *testing.T) {
 	}
 	if _, err := ResolveInRoot(root, "relative"); err == nil {
 		t.Error("relative path accepted")
+	}
+}
+
+func TestResolveInRootNoEscapeThroughMissing(t *testing.T) {
+	root := t.TempDir()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(root+"/etc", 0o755))
+	// Existing absolute symlink: a ".." after a missing component must not
+	// climb back through it onto the host.
+	must(os.Symlink("/etc", root+"/a"))
+	for _, in := range []string{"/missing/../a/evil", "/missing/../../a", "/x/y/../../a/evil/deep"} {
+		got, err := ResolveInRoot(root, in)
+		if err != nil {
+			t.Fatalf("%q: %v", in, err)
+		}
+		// The resolved path must stay inside root, never name the host's /etc.
+		if rel, _ := filepath.Rel(root, got); len(rel) >= 2 && rel[:2] == ".." {
+			t.Errorf("%q escaped root: %s", in, got)
+		}
+		if got == "/etc/evil" || strings.HasPrefix(got, "/etc/") {
+			t.Errorf("%q resolved to host path %s", in, got)
+		}
+	}
+	got, err := ResolveInRoot(root, "/missing/../a/evil")
+	if err != nil || got != root+"/etc/evil" {
+		t.Errorf("got %q, %v; want %q", got, err, root+"/etc/evil")
+	}
+}
+
+func TestUnescapeMountpoint(t *testing.T) {
+	for in, want := range map[string]string{
+		"/plain":          "/plain",
+		"/with\\040space": "/with space",
+		"/tab\\011x":      "/tab\tx",
+		"/nl\\012x":       "/nl\nx",
+		"/bs\\134x":       `/bs\x`,
+		"/bad\\xyz":       `/bad\xyz`,
+		"/trailing\\":     `/trailing\`,
+		"/oct\\101bc":     "/octAbc",
+	} {
+		if got := unescapeMountpoint(in); got != want {
+			t.Errorf("%q => %q, want %q", in, got, want)
+		}
 	}
 }
 

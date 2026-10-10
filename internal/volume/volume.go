@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Dir returns the volumes root.
@@ -50,9 +52,16 @@ type Info struct {
 	Created time.Time `json:"created"`
 }
 
-// List returns all volumes, oldest first.
-func List(root string) []Info {
-	ents, _ := os.ReadDir(Dir(root))
+// List returns all volumes, oldest first. A missing volumes directory is
+// empty; any other read error is reported instead of an empty result.
+func List(root string) ([]Info, error) {
+	ents, err := os.ReadDir(Dir(root))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list volumes in %s: %w", Dir(root), err)
+	}
 	var out []Info
 	for _, e := range ents {
 		if !e.IsDir() {
@@ -61,12 +70,15 @@ func List(root string) []Info {
 		p := DataDir(root, e.Name())
 		st, err := os.Stat(p)
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue // incomplete volume (crash mid-create); prune drops it
+			}
+			return nil, fmt.Errorf("stat volume %s: %w", e.Name(), err)
 		}
 		out = append(out, Info{Name: e.Name(), Path: p, Created: st.ModTime().UTC()})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
-	return out
+	return out, nil
 }
 
 // Exists reports whether the volume exists.
@@ -85,6 +97,26 @@ func Remove(root, name string) error {
 		return fmt.Errorf("no such volume %q; list volumes with `minibox volume ls`", name)
 	}
 	return os.RemoveAll(p)
+}
+
+// Lock serializes volume removal against volume creation and container
+// registration: hold it across Ensure+container.Create (run/up) and across
+// the in-use check + Remove (volume rm/prune). Otherwise a concurrent
+// `volume rm` can pass its in-use check after `run` resolved the volume but
+// before the container is registered, then delete the mount source.
+func Lock(root string) (func(), error) {
+	if err := os.MkdirAll(Dir(root), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(Dir(root), ".lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { f.Close() }, nil
 }
 
 // IsNamedVolumeSource reports whether src looks like a named volume (not a host path).

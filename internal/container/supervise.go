@@ -80,15 +80,22 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		}
 		return 125, e
 	}
+	// Hold the liveness lock before any initialization: otherwise a startup
+	// lasting over 30 seconds looks abandoned to Reconcile, which could mark
+	// the container exited (and delete it with --rm) while we are starting it.
+	// A lock conflict means another supervisor may own this container, so
+	// report it without touching state or files.
+	lock, err := state.HoldLock(id)
+	if err != nil {
+		e := fmt.Errorf("lock container: %w; is it already running?", err)
+		notify(e)
+		return 125, e
+	}
+	defer state.Release(id, lock)
 	spec, err := c.initSpec()
 	if err != nil {
 		return fail(err)
 	}
-	lock, err := state.HoldLock(id)
-	if err != nil {
-		return fail(fmt.Errorf("lock container: %w; is it already running?", err))
-	}
-	defer state.Release(id, lock)
 	var cg *cgroup.Cgroup
 	if os.Geteuid() == 0 {
 		if cg, err = cgroup.Create(id, c.Config.Limits); err != nil {
@@ -179,8 +186,26 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		}
 	}
 	if info != nil {
-		if b, e := json.Marshal(info); e == nil {
-			os.WriteFile(netPath(id), b, 0o644)
+		b, e := json.Marshal(info)
+		if e != nil {
+			_ = cmd.Process.Kill()
+			cmd.Wait()
+			if master != nil {
+				master.Close()
+			}
+			return fail(fmt.Errorf("encode network info: %w", e))
+		}
+		// The lease, veth and port rules already exist at this point: if the
+		// record of them cannot be persisted, roll everything back now instead
+		// of leaking it (cleanupNetwork would find no net.json later).
+		if e := os.WriteFile(netPath(id), b, 0o644); e != nil {
+			(&network.Manager{Root: state.Root()}).Cleanup(id, info)
+			_ = cmd.Process.Kill()
+			cmd.Wait()
+			if master != nil {
+				master.Close()
+			}
+			return fail(fmt.Errorf("record network setup: %w", e))
 		}
 	}
 	defer cleanupNetwork(id)

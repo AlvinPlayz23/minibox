@@ -103,14 +103,22 @@ func TestM5ExitCodeAndRm(t *testing.T) {
 
 func TestM5KillShimThenPrune(t *testing.T) {
 	m5Root(t)
-	mb(t, "run", "-d", "--name", "k", "alpine", "sleep", "1000")
-	exec.Command("pkill", "-9", "-f", "^/proc/self/exe shim").Run()
+	out, err := mb(t, "run", "-d", "--name", "k", "alpine", "sleep", "1000")
+	if err != nil {
+		t.Fatalf("run -d: %v %s", err, out)
+	}
+	// Kill only this container's shim (a broad pkill would hit unrelated shims).
+	exec.Command("pkill", "-9", "-f", "exe shim "+strings.TrimSpace(out)).Run()
 	time.Sleep(300 * time.Millisecond)
 	if ps, _ := mb(t, "ps", "-a"); !strings.Contains(ps, "Dead") {
 		t.Fatalf("expected Dead: %s", ps)
 	}
 	if _, err := mb(t, "system", "prune"); err != nil {
 		t.Fatal(err)
+	}
+	// Prune must have finalized the dead container (not just its cgroup).
+	if ps, _ := mb(t, "ps", "-a"); !strings.Contains(ps, "Exited (137)") {
+		t.Fatalf("prune did not finalize the dead container: %s", ps)
 	}
 	leaked(t)
 	mb(t, "rm", "k")
@@ -134,14 +142,41 @@ func TestM5HundredSequentialRuns(t *testing.T) {
 
 func TestM5SigtermForegroundAndUser(t *testing.T) {
 	m5Root(t)
-	cmd := exec.Command("../../bin/minibox", "run", "--rm", "alpine", "sleep", "1000")
-	cmd.Start()
-	time.Sleep(500 * time.Millisecond)
+	// The container prints READY once running: only then can SIGTERM prove
+	// signal forwarding (an early startup failure must not pass this test).
+	cmd := exec.Command("../../bin/minibox", "run", "--rm", "alpine", "sh", "-c", "echo READY; exec sleep 1000")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	go func() {
+		var b [6]byte
+		for {
+			n, err := stdout.Read(b[:])
+			if n > 0 || err != nil {
+				close(ready)
+				return
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		cmd.Process.Kill()
+		t.Fatal("container did not become ready")
+	}
 	cmd.Process.Signal(syscallSIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	select {
-	case <-done:
+	case err := <-done:
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 143 {
+			t.Fatalf("expected exit 143 after SIGTERM, got: %v", err)
+		}
 	case <-time.After(5 * time.Second):
 		cmd.Process.Kill()
 		t.Fatal("SIGTERM did not stop the foreground container")

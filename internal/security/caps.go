@@ -6,7 +6,9 @@ package security
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -88,15 +90,34 @@ func capNum(name string) int {
 	return -1
 }
 
+// capLastCap reads the host kernel's last capability ID from
+// /proc/sys/kernel/cap_last_cap (38+ on modern kernels).
+func capLastCap() (int, error) {
+	b, err := os.ReadFile("/proc/sys/kernel/cap_last_cap")
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || n < 0 || n > 63 {
+		return 0, fmt.Errorf("bad cap_last_cap %q", b)
+	}
+	return n, nil
+}
+
 // ApplyCaps restricts the calling thread (and so everything it execs or forks) to keep:
 // bounding set, permitted, effective and inheritable are all reduced to it; ambient is cleared.
 // Call it on a thread locked with runtime.LockOSThread, right before exec/fork.
+// Capabilities the host kernel does not know (e.g. --cap-add ALL on Linux 5.7)
+// are clamped to cap_last_cap instead of failing capset.
 func ApplyCaps(keep []string) error {
 	var mask uint64
 	for _, c := range keep {
 		if n := capNum(c); n >= 0 {
 			mask |= 1 << uint(n)
 		}
+	}
+	if last, err := capLastCap(); err == nil && last < 63 {
+		mask &= (uint64(1) << (uint(last) + 1)) - 1
 	}
 	for c := 0; c < 64; c++ {
 		if mask&(1<<uint(c)) != 0 {

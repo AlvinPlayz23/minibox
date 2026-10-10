@@ -74,6 +74,9 @@ func ResolveUser(u string) (uid, gid int, err error) {
 }
 
 // DropUser switches to the given user (after the rootfs is in place).
+// A switch to the current uid/gid is a no-op: attempting it would still
+// require CAP_SETGID for setgroups, so e.g. `-u root --cap-drop SETGID`
+// would fail spuriously without this.
 func DropUser(user string) error {
 	if user == "" {
 		return nil
@@ -81,6 +84,9 @@ func DropUser(user string) error {
 	uid, gid, err := ResolveUser(user)
 	if err != nil {
 		return err
+	}
+	if uid == os.Geteuid() && gid == os.Getegid() {
+		return nil
 	}
 	if err := syscall.Setgroups([]int{gid}); err != nil {
 		return fmt.Errorf("setgroups: %w", err)
@@ -114,6 +120,17 @@ func Harden(caps []string, seccomp bool, user string) error {
 		return security.ApplySeccomp(caps)
 	}
 	return nil
+}
+
+// credentialFor returns a Credential switching to uid:gid, or nil if the
+// process already runs as those IDs. Applying an identical credential would
+// still invoke setgroups(2), which fails without CAP_SETGID — so e.g.
+// `-u root --cap-drop SETGID` must not set one.
+func credentialFor(uid, gid int) *syscall.Credential {
+	if uid == os.Geteuid() && gid == os.Getegid() {
+		return nil
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{uint32(gid)}}
 }
 
 // execFinal runs the user command: directly (execve) or, with spec.Init, as a child of
@@ -154,7 +171,7 @@ func execFinal(spec *InitSpec, path string) error {
 		if attr.Sys == nil {
 			attr.Sys = &syscall.SysProcAttr{}
 		}
-		attr.Sys.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{uint32(gid)}}
+		attr.Sys.Credential = credentialFor(uid, gid)
 	}
 	pid, err := syscall.ForkExec(path, spec.Cmd, attr)
 	if err != nil {
@@ -198,6 +215,11 @@ type ExecSpec struct {
 // namespaces and root (via /proc/PID/root; setns(mnt) is impossible from a multithreaded
 // Go process, see docs/DECISIONS.md) and runs the command as a child inside the PID namespace.
 func ExecInit() (int, error) {
+	// Pin this goroutine's thread FIRST: setns changes only the calling
+	// thread's namespaces, and the Go scheduler may otherwise migrate us to a
+	// different thread between the setns calls and ForkExec — silently running
+	// the command in the host's uts/ipc/net namespaces.
+	goruntime.LockOSThread()
 	f := os.NewFile(3, "spec")
 	var spec ExecSpec
 	if err := jsonDecode(f, &spec); err != nil {
@@ -251,7 +273,7 @@ func ExecInit() (int, error) {
 	if err != nil {
 		return 127, err
 	}
-	goruntime.LockOSThread()
+	// (Thread already pinned at function entry; see above.)
 	if err := Harden(spec.Caps, spec.Seccomp, spec.User); err != nil {
 		return 125, err
 	}
@@ -265,7 +287,7 @@ func ExecInit() (int, error) {
 		if err != nil {
 			return 125, err
 		}
-		sys.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{uint32(gid)}}
+		sys.Credential = credentialFor(uid, gid)
 	}
 	attr.Sys = sys
 	cpid, err := syscall.ForkExec(path, spec.Cmd, attr)

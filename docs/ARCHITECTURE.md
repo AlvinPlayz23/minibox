@@ -21,8 +21,9 @@ Liveness: the supervisor holds `flock($MINIBOX_ROOT/run/<id>.lock)`; the kernel 
 
 ## M5 lifecycle (internal/container, internal/cli, internal/pty)
 `run` resolves the image (pulling on demand under a shared store lock), writes
-`containers/<id>/{config.json,state.json}` and supervises: foreground inherits stdio
-(or a pty for `-t`, with raw mode + SIGWINCH resizing), detached re-execs `minibox shim`
+`containers/<id>/{config.json,state.json}` and supervises: foreground inherits
+stdout/stderr (stdin only with `-i`, else `/dev/null`; `-t` allocates a pty
+with raw mode + SIGWINCH resizing), detached re-execs `minibox shim`
 (setsid, output to a rotating 10 MB x 3 log). Init spec travels on fd 3; the child blocks
 reading it until the parent finishes outside-setup (networking). `--init` (default) keeps a
 minimal PID 1 that reaps orphans and forwards signals; `stop` sends SIGTERM then SIGKILLs the
@@ -63,7 +64,7 @@ with in-use protection. `build` supports FROM/RUN/COPY/ENV/WORKDIR/CMD/ENTRYPOIN
 overlay→OCI whiteout conversion). `up/down` run a Compose subset (no external YAML dep).
 `systemd` emits a unit re-running the container foreground (restart mapped to always/no);
 `healthcheck` execs `--health-cmd`. Out of scope (documented): Docker API socket, multi-stage
-builds, ADD magic, lazy pulling.
+builds, `ADD` in any form (rejected outright; use `COPY`), lazy pulling.
 
 ## M10 performance
 Hot path (`strace -c -f`, ~1790 syscalls/run) is dominated by Go runtime init ×3 processes

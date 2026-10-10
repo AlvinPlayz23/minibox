@@ -51,7 +51,8 @@ delegation), no `exec`.
 - Detached-container logs and `config.json` are readable by anyone who can read `MINIBOX_ROOT`
   (default `/var/lib/minibox`, mode 0755). Environment variables (secrets!) are stored in `config.json`.
 - Supervisor death kills the container (`Pdeathsig`) but cleanup of cgroup/network happens only on
-  `minibox system prune` (or the next `ps`/`rm`/`stop`).
+  `minibox system prune` or the next `rm`/`stop` targeting that container (`ps` only reports
+  the `Dead` state; it changes nothing).
 - Registry credentials are read from `MINIBOX_REGISTRY_USER/PASS` or `~/.docker/config.json` (basic `auth`
   only; credential helpers are not supported). TLS is verified; only `localhost` and hosts listed in
   `MINIBOX_INSECURE_REGISTRIES` may use plain HTTP.

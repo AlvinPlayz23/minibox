@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,7 +39,7 @@ func Exec(c *Container, o ExecOptions) (int, error) {
 	if !c.Running() {
 		return 125, fmt.Errorf("container %s is not running (status: %s); start one with `minibox run -d` first", short(c.Config.ID), c.DisplayStatus())
 	}
-	spec := runtime.ExecSpec{Pid: c.State.Pid, Cmd: o.Cmd, Env: append(append([]string(nil), c.Config.Env...), o.Env...),
+	spec := runtime.ExecSpec{Pid: c.State.Pid, Cmd: o.Cmd, Env: dedupEnv(append(append([]string(nil), c.Config.Env...), o.Env...)),
 		Workdir: o.Workdir, User: o.User, TTY: o.TTY, Caps: c.Config.Caps, Seccomp: c.Config.Seccomp}
 	if spec.Workdir == "" {
 		spec.Workdir = c.Config.Workdir
@@ -135,6 +136,23 @@ func Exec(c *Container, o ExecOptions) (int, error) {
 	return 0, werr
 }
 
+// dedupEnv keeps the last value of each key, preserving first-seen order,
+// so -e overrides win over the container's configured values.
+func dedupEnv(env []string) []string {
+	idx := map[string]int{}
+	var out []string
+	for _, e := range env {
+		k, _, _ := strings.Cut(e, "=")
+		if i, ok := idx[k]; ok {
+			out[i] = e
+			continue
+		}
+		idx[k] = len(out)
+		out = append(out, e)
+	}
+	return out
+}
+
 // Prune finalises dead containers and removes leftover cgroups, lock files and
 // half-created container directories. Returns the number of things cleaned.
 func Prune() (int, error) {
@@ -150,6 +168,13 @@ func Prune() (int, error) {
 		}
 	}
 	if ents, _ := os.ReadDir(containersDir()); ents != nil {
+		// Create() makes the directory before writing state.json; without the
+		// creation lock a concurrent Create looks abandoned here. Serialize
+		// with container creation before treating a missing state as garbage.
+		l, err := globalLock()
+		if err != nil {
+			return n, fmt.Errorf("lock %s: %w", containersDir(), err)
+		}
 		for _, e := range ents {
 			if !e.IsDir() {
 				continue
@@ -158,10 +183,12 @@ func Prune() (int, error) {
 				continue
 			}
 			if err := os.RemoveAll(Dir(e.Name())); err != nil {
+				unlock(l)
 				return n, err
 			}
 			n++
 		}
+		unlock(l)
 	}
 	// Leases and published ports of containers that no longer exist.
 	keep := map[string]bool{}
@@ -170,10 +197,14 @@ func Prune() (int, error) {
 			keep[c.Config.ID] = true
 		}
 	}
-	if ipam, err := (&network.Manager{Root: state.Root()}).IPAMForPrune(); err == nil {
-		if k, _ := ipam.ReleaseExcept(keep); k > 0 {
-			n += k
-		}
+	ipam, err := (&network.Manager{Root: state.Root()}).IPAMForPrune()
+	if err != nil {
+		return n, fmt.Errorf("load IPAM state: %w", err)
+	}
+	if k, err := ipam.ReleaseExcept(keep); err != nil {
+		return n, fmt.Errorf("release stale leases: %w", err)
+	} else if k > 0 {
+		n += k
 	}
 	for _, id := range cgroupList() {
 		if state.IsAlive(id) {

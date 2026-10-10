@@ -20,9 +20,11 @@ func ParsePort(s string) (Port, error) {
 	bad := func(why string) (Port, error) {
 		return Port{}, fmt.Errorf("invalid port mapping %q: %s; use HOST:CONTAINER, e.g. -p 8080:80 or -p 5353:53/udp", s, why)
 	}
-	spec, proto, _ := strings.Cut(s, "/")
-	if proto == "" {
+	spec, proto, hasProto := strings.Cut(s, "/")
+	if !hasProto {
 		proto = "tcp"
+	} else if proto == "" {
+		return bad("empty protocol after /; use /tcp or /udp")
 	}
 	if proto != "tcp" && proto != "udp" {
 		return bad("protocol must be tcp or udp")

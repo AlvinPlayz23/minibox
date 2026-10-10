@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -24,41 +25,45 @@ type Mount struct {
 // ResolveInRoot resolves p (an absolute path as seen inside the container) under root,
 // following symlinks *as if root were /*: an absolute symlink target or a ".." can never leave
 // root. The result is a host path inside root. Missing trailing components are allowed.
+//
+// Correctness invariant: cur is always fully resolved (contains no symlinks) and missing
+// holds only components known not to exist. A ".." therefore either pops a missing
+// component (which cannot be a symlink) or climbs within resolved space — it can never
+// climb "back" through a symlink into unvalidated territory.
 func ResolveInRoot(root, p string) (string, error) {
 	if !filepath.IsAbs(p) {
 		return "", fmt.Errorf("container path %q must be absolute", p)
 	}
-	cur := "" // path inside root, always clean and absolute ("" = /)
+	cur := "" // fully-resolved path inside root ("" = /)
+	var missing []string
+	links := 0
 	pending := strings.Split(filepath.Clean(p), "/")
-	for links := 0; len(pending) > 0; {
+	for len(pending) > 0 {
 		name := pending[0]
 		pending = pending[1:]
 		switch name {
 		case "", ".":
 			continue
 		case "..":
+			if len(missing) > 0 {
+				missing = missing[:len(missing)-1]
+				continue
+			}
 			cur = filepath.Dir(cur)
 			if cur == "." || cur == "/" {
 				cur = ""
 			}
 			continue
 		}
-		next := cur + "/" + name
-		fi, err := os.Lstat(root + next)
+		if len(missing) > 0 {
+			missing = append(missing, name)
+			continue
+		}
+		fi, err := os.Lstat(root + cur + "/" + name)
 		if err != nil {
 			if os.IsNotExist(err) {
-				cur = next // does not exist yet: append the rest verbatim (cleaned, no symlinks can exist below)
-				for _, rest := range pending {
-					if rest == ".." {
-						cur = filepath.Dir(cur)
-						if cur == "/" || cur == "." {
-							cur = ""
-						}
-					} else if rest != "" && rest != "." {
-						cur += "/" + rest
-					}
-				}
-				return root + cur, nil
+				missing = append(missing, name)
+				continue
 			}
 			return "", err
 		}
@@ -66,19 +71,23 @@ func ResolveInRoot(root, p string) (string, error) {
 			if links++; links > 40 {
 				return "", errors.New("too many levels of symbolic links")
 			}
-			t, err := os.Readlink(root + next)
+			t, err := os.Readlink(root + cur + "/" + name)
 			if err != nil {
 				return "", err
 			}
 			if strings.HasPrefix(t, "/") {
-				cur = ""
+				cur, missing = "", nil
 			}
 			pending = append(strings.Split(t, "/"), pending...)
 			continue
 		}
-		cur = next
+		cur += "/" + name
 	}
-	return root + cur, nil
+	out := root + cur
+	for _, m := range missing {
+		out += "/" + m
+	}
+	return out, nil
 }
 
 // ParseVolume parses SRC:DST[:ro|rw] into a bind Mount. src that is not a host path
@@ -196,11 +205,76 @@ func applyMount(rootfs string, m Mount) error {
 			return fmt.Errorf("bind %s on %s: %w", m.Src, m.Dst, err)
 		}
 		if m.RO {
-			if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
-				return fmt.Errorf("make %s read-only: %w", m.Dst, err)
+			// MS_REC clones nested mounts too, so a plain remount would leave
+			// submounts writable under a ":ro" volume: remount every mount at
+			// or below target read-only, deepest first.
+			if err := remountRO(target); err != nil {
+				return err
 			}
 		}
 		return nil
 	}
 	return fmt.Errorf("unknown mount type %q", m.Type)
+}
+
+// remountRO remounts target and every mount beneath it read-only, deepest first.
+func remountRO(target string) error {
+	subs, err := submounts(target)
+	if err != nil {
+		return fmt.Errorf("list mounts under %s: %w", target, err)
+	}
+	for _, m := range subs {
+		if err := unix.Mount("", m, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("make %s read-only: %w", m, err)
+		}
+	}
+	if err := unix.Mount("", target, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("make %s read-only: %w", target, err)
+	}
+	return nil
+}
+
+// submounts returns mount points at or below target, deepest first, parsed from
+// /proc/self/mountinfo (field 5; octal escapes unescaped).
+func submounts(target string) ([]string, error) {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, l := range strings.Split(string(b), "\n") {
+		f := strings.Fields(l)
+		if len(f) < 5 {
+			continue
+		}
+		mp := unescapeMountpoint(f[4])
+		if mp != target && !strings.HasPrefix(mp, target+"/") {
+			continue
+		}
+		out = append(out, mp)
+	}
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out, nil
+}
+
+// unescapeMountpoint decodes the octal escapes mountinfo uses (space, tab,
+// newline, backslash).
+func unescapeMountpoint(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\\' && i+4 <= len(s) {
+			var v int
+			if n, err := fmt.Sscanf(s[i+1:i+4], "%3o", &v); err == nil && n == 1 && v <= 255 {
+				b.WriteByte(byte(v))
+				i += 4
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
 }

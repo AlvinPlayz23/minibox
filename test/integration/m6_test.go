@@ -20,14 +20,17 @@ func needNet(t *testing.T) {
 func TestM6PullRunFromCleanStore(t *testing.T) {
 	needNet(t)
 	t.Setenv("MINIBOX_ROOT", t.TempDir())
-	for _, c := range [][]string{
-		{"run", "--rm", "alpine", "echo", "hi"},
-		{"run", "--rm", "busybox", "echo", "hi"},
-		{"run", "--rm", "debian:stable-slim", "cat", "/etc/os-release"},
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"run", "--rm", "alpine", "echo", "hi"}, "hi"},
+		{[]string{"run", "--rm", "busybox", "echo", "hi"}, "hi"},
+		{[]string{"run", "--rm", "debian:stable-slim", "cat", "/etc/os-release"}, "Debian"},
 	} {
-		out, err := mb(t, c...)
-		if err != nil || !strings.Contains(out, "hi") && !strings.Contains(out, "Debian") {
-			t.Fatalf("%v: %v\n%s", c, err, out)
+		out, err := mb(t, c.args...)
+		if err != nil || !strings.Contains(out, c.want) {
+			t.Fatalf("%v: want %q: %v\n%s", c.args, c.want, err, out)
 		}
 	}
 	if out, _ := mb(t, "images"); !strings.Contains(out, "alpine") || !strings.Contains(out, "debian") {

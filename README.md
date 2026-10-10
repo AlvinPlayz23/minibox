@@ -9,7 +9,7 @@ networking, security hardening, volumes/build/compose, performance pass).
 - Linux 5.7+ (6.8+ recommended for many-layer images), cgroup v2 unified hierarchy
 - Root for bridge networking, mounts and cgroups (rootless mode works with
   `pasta`/host networking; user namespaces must be permitted by the kernel)
-- Go 1.22+ to build; `nft` + `ip` for bridge networking; `pasta` (package `passt`)
+- Go 1.27+ to build (`go.mod` requires Go 1.27.2); `nft` + `ip` for bridge networking; `pasta` (package `passt`)
   for rootless networking
 - Optional for benchmarks: `hyperfine`, Docker, Podman, `runc`/`crun`
 
@@ -96,14 +96,14 @@ bin/minibox systemd -o /etc/systemd/system myservice
 
 | Metric | Target | Measured (M10, kernel 6.18) |
 |---|---|---|
-| Warm `run --rm alpine true` (`--network none`) | < 50 ms | ~26–31 ms mean, ~15 ms min |
+| Warm `run --rm alpine true` (`--network none`) | < 50 ms | ~26–36 ms mean, ~15 ms min |
 | Warm `run --rm` with bridge networking | < 150 ms | ~88 ms mean |
 | Idle RAM (no containers) | 0 (no daemon) | 0 |
 | RSS of detached-container shim | < 5 MB | 3.8 MB (VmHWM) |
 | Binary size | < 15 MB | 8.5 MB static |
 | Peak RSS pulling ~100+ MB image | record, keep low | ~16 MB for 152 MB postgres:16 |
-| `docker run --rm alpine true` same box | comparison | ~567 ms mean (minibox ~22x faster) |
-| `runc run` same box | floor | ~43 ms mean (minibox ~1.7x faster) |
+| `docker run --rm --network none alpine true` same box | comparison | ~370–570 ms mean (minibox ~10–22x faster) |
+| `runc run` same box | floor | ~43–75 ms mean (minibox ~1.7–2x faster) |
 
 See `docs/BENCHMARKS.md` (method + per-milestone numbers) and run
 `bench/compare.sh [IMAGE] [CMD]` to reproduce the comparison on your machine

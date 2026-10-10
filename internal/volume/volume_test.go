@@ -8,6 +8,15 @@ import (
 	"testing"
 )
 
+func mustList(t *testing.T, root string) []Info {
+	t.Helper()
+	infos, err := List(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return infos
+}
+
 func TestVolumeLifecycle(t *testing.T) {
 	root := t.TempDir()
 	p, err := Ensure(root, "data")
@@ -24,8 +33,8 @@ func TestVolumeLifecycle(t *testing.T) {
 	if !Exists(root, "data") || Exists(root, "missing") {
 		t.Error("exists check")
 	}
-	if len(List(root)) != 1 || List(root)[0].Name != "data" {
-		t.Errorf("%v", List(root))
+	if infos := mustList(t, root); len(infos) != 1 || infos[0].Name != "data" {
+		t.Errorf("%v", infos)
 	}
 	for _, bad := range []string{"", ".x", "-x", "a/b", "a b"} {
 		if _, err := Ensure(root, bad); err == nil {
@@ -38,8 +47,15 @@ func TestVolumeLifecycle(t *testing.T) {
 	if err := Remove(root, "data"); err != nil {
 		t.Fatal(err)
 	}
-	if len(List(root)) != 0 {
+	if infos := mustList(t, root); len(infos) != 0 {
 		t.Error("volume not removed")
+	}
+}
+
+func TestListMissingDirIsEmpty(t *testing.T) {
+	infos, err := List(filepath.Join(t.TempDir(), "no-such-root"))
+	if err != nil || len(infos) != 0 {
+		t.Errorf("%v %v", infos, err)
 	}
 }
 
@@ -51,5 +67,21 @@ func TestIsNamedVolumeSource(t *testing.T) {
 		if got := IsNamedVolumeSource(src); got != want {
 			t.Errorf("%q => %v", src, got)
 		}
+	}
+}
+
+func TestLockSerializes(t *testing.T) {
+	root := t.TempDir()
+	unlock, err := Lock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	// Creation still works while the lock is held by us.
+	if _, err := Ensure(root, "v"); err != nil {
+		t.Fatal(err)
+	}
+	if infos := mustList(t, root); len(infos) != 1 {
+		t.Errorf("%v", infos)
 	}
 }

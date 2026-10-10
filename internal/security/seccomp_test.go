@@ -105,6 +105,29 @@ func TestFilterVerdicts(t *testing.T) {
 			}
 		}
 	}
+	// personality: only the default domains and persona-get pass.
+	if nr, ok := sysnums["personality"]; ok {
+		for arg, want := range map[uint32]uint32{
+			0: retAllow, 8: retAllow, 0xffffffff: retAllow,
+			0x00040000 /* ADDR_NO_RANDOMIZE */ : errnoRet(syscall.EPERM),
+			0x00080000 /* READ_IMPLIES_EXEC */ : errnoRet(syscall.EPERM),
+			0x010000 /* ADDR_COMPAT_LAYOUT */ :  errnoRet(syscall.EPERM),
+		} {
+			if got := run(t, def, auditArch, nr, arg); got != want {
+				t.Errorf("personality(%#x): got %#x want %#x", arg, got, want)
+			}
+		}
+	}
+	// syslog needs CAP_SYSLOG, which is not in the default set.
+	if nr, ok := sysnums["syslog"]; ok {
+		if got := run(t, def, auditArch, nr, 0); got != errnoRet(syscall.EPERM) {
+			t.Errorf("syslog default: %#x", got)
+		}
+		sys, _ := BuildFilter(append([]string{"SYSLOG"}, DefaultCaps...))
+		if got := run(t, sys, auditArch, nr, 0); got != retAllow {
+			t.Errorf("syslog with SYSLOG: %#x", got)
+		}
+	}
 	// With SYS_ADMIN the mount family is allowed again.
 	adm, _ := BuildFilter(append([]string{"SYS_ADMIN"}, DefaultCaps...))
 	if got := run(t, adm, auditArch, sysnums["mount"], 0); got != retAllow {

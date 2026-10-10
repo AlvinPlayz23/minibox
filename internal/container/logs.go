@@ -62,13 +62,17 @@ func (w *logWriter) rotate() {
 func (w *logWriter) Close() error { return w.f.Close() }
 
 // Logs writes the container's log (oldest rotated file first) to out; with follow it keeps
-// streaming until the container stops.
+// streaming until the container stops. Copy errors are propagated: a failed
+// writer must not spin in follow mode nor return a silently truncated log.
 func Logs(c *Container, out io.Writer, follow bool) error {
 	base := logPath(c.Config.ID)
 	for i := logKeep; i >= 1; i-- {
 		if f, err := os.Open(fmt.Sprintf("%s.%d", base, i)); err == nil {
-			io.Copy(out, f)
+			_, cerr := io.Copy(out, f)
 			f.Close()
+			if cerr != nil {
+				return cerr
+			}
 		}
 	}
 	f, err := os.Open(base)
@@ -82,8 +86,14 @@ func Logs(c *Container, out io.Writer, follow bool) error {
 		return err
 	}
 	defer f.Close()
+	drain := func() error {
+		_, err := io.Copy(out, f)
+		return err
+	}
 	for {
-		io.Copy(out, f)
+		if err := drain(); err != nil {
+			return err
+		}
 		if !follow {
 			return nil
 		}
@@ -91,7 +101,9 @@ func Logs(c *Container, out io.Writer, follow bool) error {
 		// Rotation: the path now names a different file; drain the old one, then switch.
 		var a, b syscall.Stat_t
 		if syscall.Fstat(int(f.Fd()), &a) == nil && syscall.Stat(base, &b) == nil && a.Ino != b.Ino {
-			io.Copy(out, f)
+			if err := drain(); err != nil {
+				return err
+			}
 			f.Close()
 			if f, err = os.Open(base); err != nil {
 				return err
@@ -100,8 +112,7 @@ func Logs(c *Container, out io.Writer, follow bool) error {
 		}
 		_ = c.Refresh()
 		if !c.Running() {
-			io.Copy(out, f)
-			return nil
+			return drain()
 		}
 	}
 }

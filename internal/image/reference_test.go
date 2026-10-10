@@ -23,7 +23,7 @@ func TestParseReference(t *testing.T) {
 			t.Errorf("%q => %q, %v; want %q", in, r.Name(), err, want)
 		}
 	}
-	for _, bad := range []string{"", " ", "A/b", "a b", "alpine:", "alpine@sha256:xyz", "alpine@md5:abc", "a//b", "-x", "/x", "x/", "ghcr.io/", "alpine:tag:two", "UPPER", "a:../x", "host:99999999/x"} {
+	for _, bad := range []string{"", " ", "A/b", "a b", "alpine:", "alpine@sha256:xyz", "alpine@md5:abc", "a//b", "-x", "/x", "x/", "ghcr.io/", "alpine:tag:two", "UPPER", "a:../x", "host:99999999/x", "registry.example:65536/x", "registry.example:0/x"} {
 		if r, err := ParseReference(bad); err == nil {
 			t.Errorf("%q accepted as %q", bad, r.Name())
 		}

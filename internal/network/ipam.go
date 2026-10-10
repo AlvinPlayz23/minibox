@@ -57,13 +57,15 @@ func (m *IPAM) locked(fn func(*ipamState) error) error {
 	}
 	st := &ipamState{Leases: map[string]string{}}
 	path := filepath.Join(m.Dir, "ipam.json")
-	if b, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(b, st); err != nil {
-			return fmt.Errorf("corrupt %s: %w; delete it if no containers use the bridge network", path, err)
+	if b, err := os.ReadFile(path); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("read %s: %w; fix permissions or delete it if no containers use the bridge network", path, err)
 		}
-		if st.Leases == nil {
-			st.Leases = map[string]string{}
-		}
+	} else if err := json.Unmarshal(b, st); err != nil {
+		return fmt.Errorf("corrupt %s: %w; delete it if no containers use the bridge network", path, err)
+	}
+	if st.Leases == nil {
+		st.Leases = map[string]string{}
 	}
 	if err := fn(st); err != nil {
 		return err

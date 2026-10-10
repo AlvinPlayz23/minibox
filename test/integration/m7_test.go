@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -18,8 +19,17 @@ func netLeaks(t *testing.T) {
 	if out, _ := exec.Command("nft", "list", "table", "ip", "minibox").Output(); strings.Contains(string(out), "elements") {
 		t.Errorf("leaked published port: %s", out)
 	}
-	if b, err := os.ReadFile(os.Getenv("MINIBOX_ROOT") + "/network/ipam.json"); err == nil && strings.Contains(string(b), `"172.`) {
-		t.Errorf("leaked IP lease: %s", b)
+	// Parse ipam.json instead of matching a subnet prefix: MINIBOX_SUBNET
+	// may point anywhere.
+	if b, err := os.ReadFile(os.Getenv("MINIBOX_ROOT") + "/network/ipam.json"); err == nil {
+		var st struct {
+			Leases map[string]string `json:"leases"`
+		}
+		if err := json.Unmarshal(b, &st); err != nil {
+			t.Errorf("unparseable ipam.json: %v", err)
+		} else if len(st.Leases) > 0 {
+			t.Errorf("leaked IP lease(s): %v", st.Leases)
+		}
 	}
 }
 
@@ -67,7 +77,15 @@ func TestM7NoneAndHost(t *testing.T) {
 	if strings.TrimSpace(out) != "0" {
 		t.Errorf("none mode has eth0: %q", out)
 	}
-	out, _ = mb(t, "run", "--rm", "--network", "host", "alpine", "sh", "-c", "ip -o link | grep -c minibox0")
+	// Host mode must see host links; ensure the bridge exists first so this
+	// test does not depend on other tests having created minibox0.
+	if _, err := mb(t, "run", "--rm", "--network", "bridge", "alpine", "true"); err != nil {
+		t.Fatalf("bridge setup: %v", err)
+	}
+	out, err := mb(t, "run", "--rm", "--network", "host", "alpine", "sh", "-c", "ip -o link | grep -c minibox0")
+	if err != nil {
+		t.Fatalf("host mode run failed: %v %q", err, out)
+	}
 	if strings.TrimSpace(out) == "0" {
 		t.Errorf("host mode does not see host links: %q", out)
 	}
@@ -79,8 +97,14 @@ func TestM7NoneAndHost(t *testing.T) {
 
 func TestM7KillShimCleansNetwork(t *testing.T) {
 	m5Root(t)
-	mb(t, "run", "-d", "-p", "18081:80", "alpine", "sleep", "1000")
-	exec.Command("pkill", "-9", "-f", "^/proc/self/exe shim").Run()
+	out, err := mb(t, "run", "-d", "-p", "18081:80", "alpine", "sleep", "1000")
+	if err != nil {
+		t.Fatalf("run -d: %v %s", err, out)
+	}
+	// Kill only this container's shim: a broad pkill would take down every
+	// detached minibox shim on the host, including unrelated containers.
+	id := strings.TrimSpace(out)
+	exec.Command("pkill", "-9", "-f", "exe shim "+id).Run()
 	time.Sleep(300 * time.Millisecond)
 	mb(t, "system", "prune")
 	netLeaks(t)

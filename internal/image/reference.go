@@ -4,6 +4,7 @@ package image
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -81,6 +82,12 @@ func ParseReference(s string) (Reference, error) {
 	}
 	if !hostRe().MatchString(r.Registry) {
 		return bad("bad registry host")
+	}
+	if host, port, ok := strings.Cut(r.Registry, ":"); ok {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return bad(fmt.Sprintf("bad registry port %q in %q", port, host))
+		}
 	}
 	if r.Registry == "docker.io" && !strings.Contains(s, "/") {
 		s = "library/" + s

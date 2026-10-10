@@ -95,7 +95,16 @@ func (m *Manager) ensureBridge(ip *IPAM) (netlink.Link, error) {
 	if err := netlink.LinkSetUp(br); err != nil {
 		return nil, err
 	}
-	_ = sysctl("/proc/sys/net/ipv4/ip_forward", "1")
+	// These writes are load-bearing: without ip_forward there is no outbound
+	// connectivity, and without route_localnet `curl localhost:PORT` cannot reach
+	// published ports. A read-only /proc/sys must fail the setup loudly instead
+	// of leaving a half-working network.
+	if err := sysctl("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
+		return nil, fmt.Errorf("enable IPv4 forwarding: %w (bridge networking needs write access to /proc/sys)", err)
+	}
+	if cur, err := os.ReadFile("/proc/sys/net/ipv4/ip_forward"); err != nil || strings.TrimSpace(string(cur)) != "1" {
+		return nil, fmt.Errorf("enable IPv4 forwarding: /proc/sys/net/ipv4/ip_forward is %q (bridge networking needs write access to /proc/sys)", strings.TrimSpace(string(cur)))
+	}
 	// Lets `curl localhost:PORT` reach published ports (locally generated traffic DNATed to the bridge).
 	_ = sysctl("/proc/sys/net/ipv4/conf/"+BridgeName+"/route_localnet", "1")
 	return br, nil
@@ -104,7 +113,9 @@ func (m *Manager) ensureBridge(ip *IPAM) (netlink.Link, error) {
 // Setup configures networking for the container whose init has pid (already in its own netns
 // for none/bridge/pasta). hostname/ports come from the container config.
 func (m *Manager) Setup(id string, pid int, mode string, ports []Port) (*Info, error) {
-	info := &Info{Mode: mode, Ports: ports}
+	// info.Ports starts empty and is only populated with mappings this setup
+	// successfully added: Cleanup must never delete another container's rules.
+	info := &Info{Mode: mode}
 	switch mode {
 	case Host:
 		if len(ports) > 0 {
@@ -133,6 +144,14 @@ func (m *Manager) Setup(id string, pid int, mode string, ports []Port) (*Info, e
 	br, err := m.ensureBridge(ipam)
 	if err != nil {
 		return nil, err
+	}
+	if len(ports) > 0 {
+		// Published ports are only reachable via localhost when the bridge
+		// accepts loopback-routed packets; fail loudly instead of publishing
+		// ports that `curl localhost:PORT` can never reach.
+		if cur, err := os.ReadFile("/proc/sys/net/ipv4/conf/" + BridgeName + "/route_localnet"); err != nil || strings.TrimSpace(string(cur)) != "1" {
+			return nil, fmt.Errorf("publishing ports needs /proc/sys/net/ipv4/conf/%s/route_localnet=1 (got %q); bridge networking needs write access to /proc/sys", BridgeName, strings.TrimSpace(string(cur)))
+		}
 	}
 	if err := fw.EnsureBase(ipam.Subnet.String()); err != nil {
 		return nil, err
@@ -207,6 +226,7 @@ func (m *Manager) Setup(id string, pid int, mode string, ports []Port) (*Info, e
 			return fail(err)
 		}
 	}
+	info.Ports = ports
 	return info, nil
 }
 
@@ -332,7 +352,10 @@ func HostsFile(hostname, ip string) string {
 
 // WriteFiles writes resolv.conf and hosts under dir and returns [src, dst] bind pairs.
 func WriteFiles(dir, hostname string, info *Info) ([][2]string, error) {
-	resolv := ResolvConf("/etc/resolv.conf", info.Mode == Bridge)
+	// Pasta netns has its own loopback, so host loopback resolvers (e.g. a
+	// 127.0.0.53 stub) are unreachable there just like on the bridge.
+	bridged := info.Mode == Bridge || info.Mode == Pasta
+	resolv := ResolvConf("/etc/resolv.conf", bridged)
 	if info.Mode == None {
 		resolv = ""
 	}

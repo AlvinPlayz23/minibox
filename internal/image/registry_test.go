@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func dig(b []byte) string { s := sha256.Sum256(b); return "sha256:" + hex.EncodeToString(s[:]) }
@@ -39,7 +41,8 @@ func tarGz(t *testing.T, files map[string]string) (gz []byte, diffID string) {
 }
 
 // fakeRegistry serves one image "app" (an index with a linux/<arch> and an attestation entry)
-// behind bearer-token auth. corrupt flips a byte in the layer blob responses.
+// behind bearer-token auth. corrupt flips a byte in the layer blob responses
+// only (the config stays intact so the pull reaches layer verification).
 func fakeRegistry(t *testing.T, corrupt bool) (*httptest.Server, *atomic.Int32) {
 	l1, d1 := tarGz(t, map[string]string{"a.txt": "layer one"})
 	l2, d2 := tarGz(t, map[string]string{"b.txt": "layer two"})
@@ -84,7 +87,9 @@ func fakeRegistry(t *testing.T, corrupt bool) (*httptest.Server, *atomic.Int32) 
 				http.NotFound(w, r)
 				return
 			}
-			if corrupt && len(b) > 100 {
+			// Corrupt layers only: the config must verify so the pull
+			// reaches compressed-blob verification (the point of the test).
+			if corrupt && !bytes.Equal(b, cfg) {
 				b = append([]byte(nil), b...)
 				b[len(b)/2] ^= 0xff
 			}
@@ -143,7 +148,7 @@ func TestPullRejectsCorruptedBlob(t *testing.T) {
 	}
 	ents, _ := os.ReadDir(s.blobsDir())
 	for _, e := range ents {
-		if !strings.HasPrefix(e.Name(), ".tmp-") && false {
+		if !strings.HasPrefix(e.Name(), ".tmp-") {
 			t.Errorf("blob visible after mismatch: %s", e.Name())
 		}
 	}
@@ -168,6 +173,91 @@ func TestPullDiffIDMismatchNotPublished(t *testing.T) {
 	if ents, _ := os.ReadDir(s.layersDir()); len(ents) != 0 && !(len(ents) == 1 && ents[0].Name() == "l") {
 		t.Fatalf("layer published: %v", ents)
 	}
+}
+
+func TestParseChallengeCaseInsensitive(t *testing.T) {
+	for _, scheme := range []string{"Bearer", "bearer", "BEARER", "BeArEr"} {
+		ch := parseChallenge(scheme + ` realm="https://auth.example/token",service="s",scope="repository:a/b:pull"`)
+		if ch["realm"] != "https://auth.example/token" || ch["service"] != "s" || ch["scope"] != "repository:a/b:pull" {
+			t.Errorf("%q => %v", scheme, ch)
+		}
+	}
+}
+
+func TestFetchTokenAccessTokenOnly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// OAuth-style response with only access_token (no "token" key).
+		json.NewEncoder(w).Encode(map[string]string{"access_token": "tok123", "token_type": "Bearer"})
+	}))
+	defer srv.Close()
+	c := NewClient()
+	for _, scheme := range []string{"Bearer", "BEARER"} {
+		tok, err := c.fetchToken(context.Background(),
+			Reference{Registry: "example.com", Repo: "a/b"},
+			fmt.Sprintf(`%s realm="%s/t",service="s"`, scheme, srv.URL))
+		if err != nil || tok != "tok123" {
+			t.Errorf("%s: tok=%q err=%v", scheme, tok, err)
+		}
+	}
+}
+
+func TestSizeCappedReader(t *testing.T) {
+	// Exact size passes through untouched.
+	r := &sizeCappedReader{r: strings.NewReader("12345678"), max: 8}
+	if b, err := io.ReadAll(r); err != nil || string(b) != "12345678" {
+		t.Errorf("exact: %q %v", b, err)
+	}
+	// Overlong is rejected, not silently truncated.
+	r = &sizeCappedReader{r: strings.NewReader("123456789"), max: 8}
+	b, err := io.ReadAll(r)
+	if err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Errorf("overlong: %q %v", b, err)
+	}
+	// Short bodies pass (digest verification rejects them later).
+	r = &sizeCappedReader{r: strings.NewReader("123"), max: 8}
+	if b, err := io.ReadAll(r); err != nil || string(b) != "123" {
+		t.Errorf("short: %q %v", b, err)
+	}
+}
+
+func TestWatchdogBodyStall(t *testing.T) {
+	// A server that sends headers and then stalls mid-body.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Stall until the client goes away (or a bound, for safety).
+		select {
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	c := NewClient()
+	c.StallTimeout = 150 * time.Millisecond
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	// The request carries ctx so the watchdog's cancel aborts the transport
+	// read, exactly like get() wires its derived context.
+	req, _ := http.NewRequestWithContext(ctx, "GET", srv.URL, nil)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc := watchBody(ctx, cancel, resp.Body, c.stallTimeout())
+	if _, err := io.ReadAll(rc); err != errStalled {
+		t.Fatalf("stall: %v", err)
+	}
+	rc.Close()
+	// Live data passes through untouched.
+	ctx2, cancel2 := context.WithCancelCause(context.Background())
+	defer cancel2(nil)
+	rc2 := watchBody(ctx2, cancel2, io.NopCloser(strings.NewReader("data")), time.Second)
+	if b, err := io.ReadAll(rc2); err != nil || string(b) != "data" {
+		t.Errorf("live: %q %v", b, err)
+	}
+	rc2.Close()
 }
 
 func TestGC(t *testing.T) {

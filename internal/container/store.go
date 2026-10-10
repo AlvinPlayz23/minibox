@@ -83,12 +83,14 @@ func writeJSON(path string, v any) error {
 	return os.Rename(tmp, path)
 }
 
-// globalLock serialises create/name checks across CLI invocations.
+// globalLock serialises create/name checks across CLI invocations. The lock
+// file lives next to containers/ (not inside it): tests assert that
+// containers/ holds only container directories.
 func globalLock() (*os.File, error) {
 	if err := os.MkdirAll(containersDir(), 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(containersDir(), ".lock"), os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(filepath.Join(state.Root(), ".containers.lock"), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, err
 	}

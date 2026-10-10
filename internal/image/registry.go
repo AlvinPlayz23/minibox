@@ -54,6 +54,9 @@ type Client struct {
 	HTTP *http.Client
 	// Platform to select from manifest lists.
 	OS, Arch, Variant string
+	// StallTimeout bounds how long a response body may go without yielding
+	// bytes (zero means bodyIdleTimeout). Tests set this low.
+	StallTimeout time.Duration
 
 	mu     sync.Mutex
 	tokens map[string]string // scope -> bearer token
@@ -123,7 +126,11 @@ func credentials(registry string) (user, pass string) {
 
 func parseChallenge(h string) map[string]string {
 	out := map[string]string{}
-	h = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(h, "Bearer "), "bearer "))
+	h = strings.TrimSpace(h)
+	// The auth-scheme name is case-insensitive (RFC 9110 §11.4).
+	if i := strings.IndexByte(h, ' '); i > 0 && strings.EqualFold(h[:i], "bearer") {
+		h = strings.TrimSpace(h[i+1:])
+	}
 	for _, part := range strings.Split(h, ",") {
 		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
 		if ok {
@@ -165,7 +172,10 @@ func (c *Client) fetchToken(ctx context.Context, ref Reference, challenge string
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("auth token request to %s failed: %s; check the image name or set MINIBOX_REGISTRY_USER/MINIBOX_REGISTRY_PASS", u.Host, resp.Status)
 	}
-	var t struct{ Token, AccessToken string }
+	var t struct {
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&t); err != nil {
 		return "", err
 	}
@@ -182,12 +192,99 @@ func (c *Client) fetchToken(ctx context.Context, ref Reference, challenge string
 	return tok, nil
 }
 
+// bodyIdleTimeout bounds how long a response body may go without yielding
+// bytes. ResponseHeaderTimeout only covers headers, and callers use
+// context.Background(), so without this a registry that stalls mid-layer
+// would block a pull forever with nothing to retry on.
+const bodyIdleTimeout = 60 * time.Second
+
+// errStalled reports a stalled body; downloadBlob retries on it.
+var errStalled = errors.New("registry stopped sending data (60s without bytes)")
+
+// watchdogBody cancels its request when the body goes idle, interrupting an
+// otherwise uninterruptible blocked Read.
+type watchdogBody struct {
+	io.ReadCloser
+	ctx     context.Context
+	cancel  context.CancelCauseFunc
+	timeout time.Duration
+	mu      sync.Mutex
+	last    time.Time
+	done    chan struct{}
+	once    sync.Once
+}
+
+func watchBody(ctx context.Context, cancel context.CancelCauseFunc, rc io.ReadCloser, timeout time.Duration) io.ReadCloser {
+	b := &watchdogBody{ReadCloser: rc, ctx: ctx, cancel: cancel, timeout: timeout, last: time.Now(), done: make(chan struct{})}
+	go b.watch()
+	return b
+}
+
+func (b *watchdogBody) touch() {
+	b.mu.Lock()
+	b.last = time.Now()
+	b.mu.Unlock()
+}
+
+func (b *watchdogBody) watch() {
+	t := time.NewTicker(b.timeout / 4)
+	defer t.Stop()
+	for {
+		select {
+		case <-b.done:
+			return
+		case now := <-t.C:
+			b.mu.Lock()
+			idle := now.Sub(b.last)
+			b.mu.Unlock()
+			if idle > b.timeout {
+				b.cancel(errStalled)
+				return
+			}
+		}
+	}
+}
+
+func (b *watchdogBody) stop() {
+	b.once.Do(func() { close(b.done) })
+}
+
+func (b *watchdogBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.touch()
+	}
+	if err != nil {
+		b.stop()
+		if context.Cause(b.ctx) == errStalled {
+			return 0, errStalled
+		}
+	}
+	return n, err
+}
+
+func (b *watchdogBody) Close() error {
+	b.stop()
+	b.cancel(nil) // release the derived context; the parent is often Background
+	return b.ReadCloser.Close()
+}
+
+// stallTimeout returns the configured body idle timeout.
+func (c *Client) stallTimeout() time.Duration {
+	if c.StallTimeout > 0 {
+		return c.StallTimeout
+	}
+	return bodyIdleTimeout
+}
+
 // get performs an authenticated GET, answering one 401 challenge. The caller closes the body.
 func (c *Client) get(ctx context.Context, ref Reference, path, accept string) (*http.Response, error) {
 	u := scheme(ref.APIHost()) + "://" + ref.APIHost() + "/v2/" + ref.Repo + path
+	ctx, cancel := context.WithCancelCause(ctx)
 	for attempt := 0; attempt < 2; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
+			cancel(nil)
 			return nil, err
 		}
 		if accept != "" {
@@ -203,6 +300,10 @@ func (c *Client) get(ctx context.Context, ref Reference, path, accept string) (*
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
+			cancel(nil)
+			if context.Cause(ctx) == errStalled {
+				return nil, errStalled
+			}
 			return nil, fmt.Errorf("contact registry %s: %w; check your network", ref.APIHost(), err)
 		}
 		if resp.StatusCode == 401 && attempt == 0 {
@@ -210,6 +311,7 @@ func (c *Client) get(ctx context.Context, ref Reference, path, accept string) (*
 			resp.Body.Close()
 			if strings.HasPrefix(strings.ToLower(ch), "bearer") {
 				if _, err := c.fetchToken(ctx, ref, ch); err != nil {
+					cancel(nil)
 					return nil, err
 				}
 				continue
@@ -218,24 +320,32 @@ func (c *Client) get(ctx context.Context, ref Reference, path, accept string) (*
 			if user, _ := credentials(ref.Registry); user != "" {
 				continue
 			}
+			cancel(nil)
 			return nil, fmt.Errorf("registry %s requires authentication; set MINIBOX_REGISTRY_USER/MINIBOX_REGISTRY_PASS", ref.Registry)
 		}
+		fail := func(format string, a ...any) (*http.Response, error) {
+			resp.Body.Close()
+			return nil, fmt.Errorf(format, a...)
+		}
+		var ferr error
+		var fresp *http.Response
 		switch {
 		case resp.StatusCode == 404:
-			resp.Body.Close()
-			return nil, fmt.Errorf("%s not found on %s (404); check the name and tag", ref.Name(), ref.Registry)
+			fresp, ferr = fail("%s not found on %s (404); check the name and tag", ref.Name(), ref.Registry)
 		case resp.StatusCode == 401 || resp.StatusCode == 403:
-			resp.Body.Close()
-			return nil, fmt.Errorf("access to %s denied (%s); it may be private: set MINIBOX_REGISTRY_USER/MINIBOX_REGISTRY_PASS", ref.Name(), resp.Status)
+			fresp, ferr = fail("access to %s denied (%s); it may be private: set MINIBOX_REGISTRY_USER/MINIBOX_REGISTRY_PASS", ref.Name(), resp.Status)
 		case resp.StatusCode == 429:
-			resp.Body.Close()
-			return nil, fmt.Errorf("registry %s rate-limited the request (429); wait and retry, or authenticate", ref.Registry)
+			fresp, ferr = fail("registry %s rate-limited the request (429); wait and retry, or authenticate", ref.Registry)
 		case resp.StatusCode != 200:
-			resp.Body.Close()
-			return nil, fmt.Errorf("registry %s returned %s for %s", ref.Registry, resp.Status, path)
+			fresp, ferr = fail("registry %s returned %s for %s", ref.Registry, resp.Status, path)
+		default:
+			resp.Body = watchBody(ctx, cancel, resp.Body, c.stallTimeout())
+			return resp, nil
 		}
-		return resp, nil
+		cancel(nil)
+		return fresp, ferr
 	}
+	cancel(nil)
 	return nil, errors.New("authentication failed")
 }
 
@@ -387,6 +497,12 @@ func (c *Client) downloadBlob(ctx context.Context, s *Store, ref Reference, d de
 			if progress != nil {
 				r = &countReader{r: r, f: progress}
 			}
+			// Cap the body at the manifest's declared size: an overlong
+			// response would otherwise fill the store's temp blob before
+			// digest verification can reject it.
+			if d.Size > 0 {
+				r = &sizeCappedReader{r: r, max: d.Size}
+			}
 			_, _, err = s.PutBlob(r, d.Digest)
 			return err
 		}()
@@ -406,6 +522,30 @@ func (c *countReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
 		c.f(int64(n))
+	}
+	return n, err
+}
+
+// sizeCappedReader rejects bodies longer than the manifest's declared layer
+// size (a short body still fails later at digest verification). One byte of
+// slack distinguishes an exact-size body from an overlong one.
+type sizeCappedReader struct {
+	r   io.Reader
+	max int64
+	n   int64
+}
+
+func (c *sizeCappedReader) Read(p []byte) (int, error) {
+	if c.n > c.max {
+		return 0, fmt.Errorf("layer is longer than the %d bytes the manifest declares", c.max)
+	}
+	if int64(len(p)) > c.max+1-c.n {
+		p = p[:c.max+1-c.n]
+	}
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	if c.n > c.max {
+		return n, fmt.Errorf("layer is longer than the %d bytes the manifest declares (truncated response or tampered registry)", c.max)
 	}
 	return n, err
 }

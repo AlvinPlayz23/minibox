@@ -56,9 +56,20 @@ func TestM8ReadOnlyAndUser(t *testing.T) {
 	if !strings.Contains(out, "1000") || !strings.Contains(out, "CapEff:\t0000000000000000") {
 		t.Errorf("-u: %s", out)
 	}
-	out, _ = mb(t, "run", "--rm", "--network", "none", "alpine", "cat", "/proc/kcore")
-	if strings.Contains(out, "ELF") {
-		t.Errorf("/proc/kcore readable")
+	// A no-op user switch (root while already root) must not require the
+	// dropped SETGID/SETUID capabilities.
+	out, err := mb(t, "run", "--rm", "--network", "none", "-u", "root", "--cap-drop", "SETGID", "--cap-drop", "SETUID", "alpine", "id", "-u")
+	if err != nil || strings.TrimSpace(out) != "0" {
+		t.Errorf("-u root with dropped SETGID/SETUID: %v %q", err, out)
+	}
+	out, err = mb(t, "run", "--rm", "--network", "none", "alpine", "sh", "-c", "cat /proc/kcore; echo rc=$?")
+	if err == nil && strings.Contains(out, "ELF") {
+		t.Errorf("/proc/kcore readable: %q", out)
+	}
+	// The rc= marker proves cat actually ran: a startup failure before exec
+	// must fail this test instead of passing vacuously.
+	if !strings.Contains(out, "rc=") {
+		t.Errorf("/proc/kcore check never ran: %q (err=%v)", out, err)
 	}
 	leaked(t)
 }

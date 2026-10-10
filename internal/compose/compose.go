@@ -179,8 +179,16 @@ func parseService(lines []line, i int, svc *Service) (int, error) {
 		case "command":
 			if val != "" {
 				svc.CommandRaw = val
-				// String form: keep as one shell command? Split respecting quotes.
-				svc.Command = splitShell(unquote(val))
+				if strings.HasPrefix(strings.TrimSpace(val), "[") {
+					items, err := parseInlineList(val)
+					if err != nil {
+						return 0, fmt.Errorf("line %d: %w", l.num, err)
+					}
+					svc.Command = items
+				} else {
+					// String form: split respecting quotes.
+					svc.Command = splitShell(unquote(val))
+				}
 				i++
 			} else {
 				items, ni, err := parseList(lines, i+1, 6)

@@ -183,7 +183,9 @@ func (s *Store) fetchLayer(ctx context.Context, c *Client, ref Reference, d desc
 	return nil
 }
 
-// ListImages returns all image records, sorted by name.
+// ListImages returns all image records, sorted by name. A malformed or
+// unreadable record is an error: callers (notably GC) must not silently treat
+// such images as absent and delete their layers.
 func (s *Store) ListImages() ([]*Image, error) {
 	var out []*Image
 	root := filepath.Join(s.Root, "images")
@@ -197,31 +199,47 @@ func (s *Store) ListImages() ([]*Image, error) {
 		if e.IsDir() || !strings.HasSuffix(p, ".json") {
 			return nil
 		}
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			return nil // unfinished atomic save; GC removes these
+		}
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return nil
+			return fmt.Errorf("read image record %s: %w", p, err)
 		}
 		var img Image
-		if json_unmarshal(b, &img) == nil && img.Name != "" {
-			out = append(out, &img)
+		if err := json_unmarshal(b, &img); err != nil {
+			return fmt.Errorf("corrupt image record %s: %w", p, err)
 		}
+		if img.Name == "" {
+			return fmt.Errorf("corrupt image record %s: missing name", p)
+		}
+		out = append(out, &img)
 		return nil
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, err
 }
 
-// RemoveImage deletes an image record (layers are reclaimed by GC).
+// RemoveImage deletes an image record (layers are reclaimed by GC),
+// including pre-M6 records (see GetImage).
 func (s *Store) RemoveImage(name string) (string, error) {
 	p, canon, err := s.imagePath(name)
 	if err != nil {
 		return "", err
 	}
 	if err := os.Remove(p); err != nil {
-		if os.IsNotExist(err) {
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		removed := false
+		for _, legacy := range s.legacyPaths(name) {
+			if os.Remove(legacy) == nil {
+				removed = true
+			}
+		}
+		if !removed {
 			return "", fmt.Errorf("no such image %q; list images with `minibox images`", name)
 		}
-		return "", err
 	}
 	// Tidy now-empty directories up to images/.
 	for d := filepath.Dir(p); d != filepath.Join(s.Root, "images"); d = filepath.Dir(d) {

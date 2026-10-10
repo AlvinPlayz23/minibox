@@ -111,3 +111,12 @@ func writeFile(t *testing.T, p, s string) {
 		t.Fatal(err)
 	}
 }
+
+func TestParsePortTrailingSlash(t *testing.T) {
+	if _, err := ParsePort("5353:53/"); err == nil {
+		t.Error("trailing / accepted as tcp")
+	}
+	if p, err := ParsePort("5353:53/udp"); err != nil || p.Proto != "udp" {
+		t.Errorf("%+v %v", p, err)
+	}
+}

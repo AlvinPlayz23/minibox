@@ -49,6 +49,7 @@ var blocked = map[string]string{
 	"perf_event_open": "SYS_ADMIN", "process_vm_readv": "SYS_PTRACE", "process_vm_writev": "SYS_PTRACE", "ptrace": "SYS_PTRACE",
 	"pidfd_getfd": "SYS_PTRACE", "settimeofday": "SYS_TIME", "stime": "SYS_TIME", "uselib": "", "userfaultfd": "SYS_PTRACE",
 	"ustat": "", "io_uring_setup": "", "io_uring_enter": "", "io_uring_register": "", "kexec": "SYS_BOOT",
+	"syslog": "SYSLOG",
 }
 
 type verdict uint8
@@ -58,6 +59,7 @@ const (
 	vDeny
 	vENOSYS
 	vClone
+	vPersonality
 )
 
 type seg struct {
@@ -91,6 +93,8 @@ func BuildFilter(caps []string) ([]insn, error) {
 			if !have["SYS_ADMIN"] {
 				v = vClone
 			}
+		case "personality":
+			v = vPersonality
 		}
 		verd[nr] = v
 	}
@@ -136,6 +140,19 @@ func leaf(v verdict) []insn {
 	case vClone:
 		return []insn{stmt(bpfLdAbsW, offArg0Lo), {Code: bpfJSET, Jt: 1, K: cloneNSFlags},
 			stmt(bpfRet, retAllow), stmt(bpfRet, errnoRet(syscall.EPERM))}
+	case vPersonality:
+		// personality() takes an unsigned int, so the low word is the whole
+		// argument. Allow only getting the persona and the default exec
+		// domains; anything else (ADDR_NO_RANDOMIZE, READ_IMPLIES_EXEC, ...)
+		// weakens ASLR/executable-memory protections for later execs.
+		return []insn{
+			stmt(bpfLdAbsW, offArg0Lo),
+			{Code: bpfJEQ, Jt: 3, K: 0},          // PER_LINUX
+			{Code: bpfJEQ, Jt: 2, K: 8},          // PER_LINUX32
+			{Code: bpfJEQ, Jt: 1, K: 0xffffffff}, // get current persona
+			stmt(bpfRet, errnoRet(syscall.EPERM)),
+			stmt(bpfRet, retAllow),
+		}
 	}
 	return []insn{stmt(bpfRet, errnoRet(syscall.EPERM))}
 }
@@ -172,8 +189,14 @@ func ApplySeccomp(caps []string) error {
 	}
 	fp := unix.SockFprog{Len: uint16(len(prog)), Filter: &prog[0]}
 	const setModeFilter, flagTSYNC = 1, 1
-	if _, _, e := unix.Syscall(unix.SYS_SECCOMP, setModeFilter, flagTSYNC, uintptr(unsafe.Pointer(&fp))); e != 0 {
+	r, _, e := unix.Syscall(unix.SYS_SECCOMP, setModeFilter, flagTSYNC, uintptr(unsafe.Pointer(&fp)))
+	if e != 0 {
 		return fmt.Errorf("install seccomp filter: %w (kernel without seccomp? use --seccomp unconfined)", e)
+	}
+	// With TSYNC the return is a thread ID, not an errno: nonzero means the
+	// filter failed to synchronize to that thread. Fail closed.
+	if r != 0 {
+		return fmt.Errorf("install seccomp filter: TSYNC failed on thread %d; use --seccomp unconfined", r)
 	}
 	return nil
 }
