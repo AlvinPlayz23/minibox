@@ -23,6 +23,7 @@ import (
 	"minibox/internal/image"
 	"minibox/internal/network"
 	"minibox/internal/runtime"
+	"minibox/internal/security"
 	"minibox/internal/state"
 )
 
@@ -87,7 +88,7 @@ func exitCode(err error) int {
 // Run implements `minibox run [flags] IMAGE [CMD...]`.
 func Run(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	var env, pubs listFlag
+	var env, pubs, capAdd, capDrop listFlag
 	detach := fs.Bool("d", false, "run in the background and print the container id")
 	fs.BoolVar(detach, "detach", false, "")
 	rm := fs.Bool("rm", false, "remove the container when it exits")
@@ -103,15 +104,20 @@ func Run(args []string) {
 	host := fs.String("hostname", "", "container hostname (default: short container id)")
 	fs.Var(&pubs, "p", "publish a port HOST:CONTAINER[/udp] (repeatable)")
 	netw := fs.String("network", "", "network mode: bridge (default as root), host, none, pasta")
+	fs.Var(&capAdd, "cap-add", "add a Linux capability (repeatable), e.g. NET_ADMIN or ALL")
+	fs.Var(&capDrop, "cap-drop", "drop a Linux capability (repeatable), e.g. NET_RAW or ALL")
+	seccompF := fs.String("seccomp", "default", "seccomp profile: default or unconfined")
+	readOnly := fs.Bool("read-only", false, "mount the container's root filesystem read-only")
 	initF := fs.Bool("init", true, "run a tiny init as PID 1 (reaps zombies, forwards signals)")
 	rootfs := fs.String("rootfs", "", "run a plain directory rootfs instead of an image (dev)")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `usage: minibox run [flags] IMAGE [CMD...]
   -d/--detach  --rm  --name NAME  -i  -t  (-it)  -e KEY=VAL  -w DIR  -u USER
   -p HOST:CONT[/udp]  --network bridge|host|none|pasta
+  --cap-add CAP  --cap-drop CAP  --seccomp default|unconfined  --read-only
   --memory 64m  --cpus 0.5  --pids-limit N  --hostname NAME  --init=false  --rootfs DIR`)
 	}
-	fs.Parse(expandShort(args, "dit", "e", "p", "w", "u", "network", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
+	fs.Parse(expandShort(args, "dit", "e", "p", "w", "u", "cap-add", "cap-drop", "seccomp", "network", "memory", "cpus", "pids-limit", "hostname", "name", "rootfs"))
 	if fs.NArg() < 1 && *rootfs == "" {
 		fs.Usage()
 		os.Exit(2)
@@ -173,12 +179,25 @@ func Run(args []string) {
 		cfg.Limits.MemoryBytes = b
 	}
 	cfg.Limits.CPUs, cfg.Limits.PidsLimit = *cpus, *pids
+	var cerr error
+	if cfg.Caps, cerr = security.ResolveCaps(capAdd, capDrop); cerr != nil {
+		die(2, "%v", cerr)
+	}
+	if *seccompF != "default" && *seccompF != "unconfined" {
+		die(2, "--seccomp must be default or unconfined")
+	}
+	cfg.Seccomp, cfg.ReadOnly = *seccompF == "default", *readOnly
 	cfg.Network = *netw
 	if cfg.Network == "" {
 		var why string
 		if cfg.Network, why = network.DefaultMode(); why != "" {
 			fmt.Fprintln(os.Stderr, "minibox:", why)
 		}
+	}
+	if cfg.Network == network.Bridge && os.Geteuid() != 0 {
+		var why string
+		cfg.Network, why = network.DefaultMode()
+		fmt.Fprintf(os.Stderr, "minibox: bridge networking needs root; falling back to %s (%s)\n", cfg.Network, why)
 	}
 	for _, p := range pubs {
 		pm, err := network.ParsePort(p)

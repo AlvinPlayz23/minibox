@@ -24,12 +24,18 @@ func MergeEnv(img []string) []string { return mergeEnv(img) }
 // blocks reading its spec until the returned send function is called; the supervisor uses that
 // window to finish setup that must happen from outside (networking). hostNet shares the host's
 // network namespace. The caller waits on the returned command and owns the cgroup.
+//
+// When not root the container gets a user namespace mapping container root to the invoking
+// user (single-ID map; no subuid ranges yet) and cg is nil (no cgroups without delegation).
 func Spawn(cg *cgroup.Cgroup, hostNet bool, stdin, stdout, stderr *os.File) (*exec.Cmd, func(InitSpec), error) {
-	fd, err := cg.OpenFD()
-	if err != nil {
-		return nil, nil, err
+	fd := -1
+	if cg != nil {
+		var err error
+		if fd, err = cg.OpenFD(); err != nil {
+			return nil, nil, err
+		}
+		defer unix.Close(fd)
 	}
-	defer unix.Close(fd)
 	specR, specW, err := os.Pipe()
 	if err != nil {
 		return nil, nil, err
@@ -45,8 +51,14 @@ func Spawn(cg *cgroup.Cgroup, hostNet bool, stdin, stdout, stderr *os.File) (*ex
 	c.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags:  flags,
 		Pdeathsig:   syscall.SIGKILL,
-		UseCgroupFD: true,
+		UseCgroupFD: cg != nil,
 		CgroupFD:    fd,
+	}
+	if os.Geteuid() != 0 {
+		c.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
+		c.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Geteuid(), Size: 1}}
+		c.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getegid(), Size: 1}}
+		c.SysProcAttr.GidMappingsEnableSetgroups = false
 	}
 	if err := c.Start(); err != nil {
 		specW.Close()
@@ -67,7 +79,7 @@ func BuildSpec(st *image.Store, img *image.Image, cdirs *storage.ContainerDirs) 
 	if err != nil {
 		return spec, err
 	}
-	ov := &storage.Overlay{Upper: cdirs.Upper, Work: cdirs.Work, Target: cdirs.Merged}
+	ov := &storage.Overlay{Upper: cdirs.Upper, Work: cdirs.Work, Target: cdirs.Merged, UserXattr: os.Geteuid() != 0}
 	for _, l := range lowers {
 		ov.Lowers = append(ov.Lowers, storage.Lower{Dir: l.Dir, Short: l.Short})
 	}

@@ -352,3 +352,40 @@ func TestSplitPath(t *testing.T) {
 		}
 	}
 }
+
+func TestUnprivilegedXattrWhiteout(t *testing.T) {
+	_, layer := sandbox(t)
+	data := mkTar(t, []ent{
+		{name: "etc/", typ: tar.TypeDir, mode: 0o755},
+		{name: "etc/.wh.passwd", mode: 0},
+		{name: "var/", typ: tar.TypeDir, mode: 0o755},
+		{name: "var/.wh..wh..opq", mode: 0},
+		{name: "var/.wh.gone", mode: 0}, // inside an opaque dir: redundant, must not appear
+		{name: "etc/keep", body: "x", mode: 0o644},
+	})
+	opts := ExtractOptions{OpaqueXattr: "user.overlay.opaque", Privileged: false}
+	if err := ExtractTar(layer, bytes.NewReader(data), opts); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Lstat(filepath.Join(layer, "etc/passwd"))
+	if err != nil || !st.Mode().IsRegular() || st.Size() != 0 {
+		t.Fatalf("xwhiteout missing: %v %v", st, err)
+	}
+	buf := make([]byte, 8)
+	n, err := unix.Getxattr(filepath.Join(layer, "etc/passwd"), "user.overlay.whiteout", buf)
+	if err == unix.ENOTSUP || err == unix.EOPNOTSUPP {
+		t.Skip("filesystem without user xattrs")
+	}
+	if err != nil || string(buf[:n]) != "y" {
+		t.Fatalf("whiteout xattr: %q %v", buf[:n], err)
+	}
+	if n, _ := unix.Getxattr(filepath.Join(layer, "etc"), "user.overlay.opaque", buf); string(buf[:n]) != "x" {
+		t.Errorf("parent opaque marker = %q, want x", buf[:n])
+	}
+	if n, _ := unix.Getxattr(filepath.Join(layer, "var"), "user.overlay.opaque", buf); string(buf[:n]) != "y" {
+		t.Errorf("opaque dir marker = %q, want y", buf[:n])
+	}
+	if _, err := os.Lstat(filepath.Join(layer, "var/gone")); err == nil {
+		t.Error("whiteout inside an opaque dir should be skipped")
+	}
+}

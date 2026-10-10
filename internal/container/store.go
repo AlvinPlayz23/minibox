@@ -36,6 +36,9 @@ type Config struct {
 	Init        bool           `json:"init"`
 	Rm          bool           `json:"rm,omitempty"`
 	Detach      bool           `json:"detach,omitempty"`
+	Caps        []string       `json:"caps"`
+	Seccomp     bool           `json:"seccomp"`
+	ReadOnly    bool           `json:"readOnly,omitempty"`
 	Network     string         `json:"network"` // bridge, host, none, pasta
 	Ports       []network.Port `json:"ports,omitempty"`
 	Limits      cgroup.Limits  `json:"limits"`
@@ -275,7 +278,7 @@ func (c *Container) Reconcile() bool {
 	if st != "dead" && !(st == "created" && !state.IsAlive(c.Config.ID) && time.Since(c.Config.Created) > 30*time.Second) {
 		return false
 	}
-	_ = cgroup.RemovePath(cgroup.Base() + "/" + c.Config.ID)
+	removeCgroup(c.Config.ID)
 	cleanupNetwork(c.Config.ID)
 	state.Release(c.Config.ID, nil)
 	_ = c.UpdateState(func(s *State) {
@@ -301,8 +304,14 @@ func Remove(c *Container, force bool) error {
 			return err
 		}
 	}
-	_ = cgroup.RemovePath(cgroup.Base() + "/" + c.Config.ID)
+	removeCgroup(c.Config.ID)
 	cleanupNetwork(c.Config.ID)
 	state.Release(c.Config.ID, nil)
 	return os.RemoveAll(Dir(c.Config.ID))
+}
+
+func removeCgroup(id string) {
+	if os.Geteuid() == 0 {
+		_ = cgroup.RemovePath(cgroup.Base() + "/" + id)
+	}
 }

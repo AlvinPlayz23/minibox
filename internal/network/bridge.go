@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -240,7 +241,11 @@ func (m *Manager) setupPasta(info *Info, pid int, ports []Port) (*Info, error) {
 		}
 		args = append(args, flag, fmt.Sprintf("%d:%d", p.HostPort, p.Container))
 	}
-	args = append(args, "--netns", fmt.Sprintf("/proc/%d/ns/net", pid))
+	if os.Geteuid() == 0 {
+		args = append(args, "--netns", fmt.Sprintf("/proc/%d/ns/net", pid))
+	} else {
+		args = append(args, strconv.Itoa(pid)) // rootless: pasta joins the container's user + net namespaces
+	}
 	cmd := exec.Command(path, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {

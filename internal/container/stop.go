@@ -37,7 +37,7 @@ func Stop(c *Container, timeout time.Duration) error {
 			return nil
 		}
 	}
-	if err := os.WriteFile(cgroup.Base()+"/"+c.Config.ID+"/cgroup.kill", []byte("1"), 0o644); err != nil && c.State.Pid > 0 {
+	if err := os.WriteFile(cgroup.Base()+"/"+c.Config.ID+"/cgroup.kill", []byte("1"), 0o644); err != nil && c.State.Pid > 0 { // rootless: no cgroup; killing PID 1 kills the PID namespace
 		_ = syscall.Kill(c.State.Pid, syscall.SIGKILL)
 	}
 	if !c.waitStopped(10 * time.Second) {

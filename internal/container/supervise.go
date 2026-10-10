@@ -54,6 +54,7 @@ func (c *Container) initSpec() (runtime.InitSpec, error) {
 	}
 	spec.Cmd, spec.Env, spec.Workdir = cfg.Cmd, cfg.Env, cfg.Workdir
 	spec.Hostname, spec.User, spec.TTY, spec.Init = cfg.Hostname, cfg.User, cfg.TTY, cfg.Init
+	spec.Caps, spec.Seccomp, spec.ReadOnly = cfg.Caps, cfg.Seccomp, cfg.ReadOnly
 	return spec, nil
 }
 
@@ -88,11 +89,15 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		return fail(fmt.Errorf("lock container: %w; is it already running?", err))
 	}
 	defer state.Release(id, lock)
-	cg, err := cgroup.Create(id, c.Config.Limits)
-	if err != nil {
-		return fail(err)
+	var cg *cgroup.Cgroup
+	if os.Geteuid() == 0 {
+		if cg, err = cgroup.Create(id, c.Config.Limits); err != nil {
+			return fail(err)
+		}
+		defer cg.Remove()
+	} else if l := c.Config.Limits; l.MemoryBytes > 0 || l.CPUs > 0 || l.PidsLimit > 0 {
+		return fail(errors.New("--memory/--cpus/--pids-limit need root (cgroup v2 delegation is not supported yet); run with sudo or drop the limit"))
 	}
-	defer cg.Remove()
 
 	var in, out, errf *os.File
 	var master *os.File
@@ -248,7 +253,9 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		}
 	}
 	// Anything left in the cgroup (daemonised children) dies with the container.
-	_ = os.WriteFile(cg.Path+"/cgroup.kill", []byte("1"), 0o644)
+	if cg != nil {
+		_ = os.WriteFile(cg.Path+"/cgroup.kill", []byte("1"), 0o644)
+	}
 	if master != nil {
 		// Let the pump drain what is already buffered, then close.
 		for _, d := range pumps {
@@ -264,7 +271,7 @@ func (c *Container) Supervise(mode Mode, ready func(error)) (code int, err error
 		}
 	}
 	cleanupNetwork(id) // before a --rm removal deletes net.json
-	oom := cg.MemoryEvents().OOMKill > 0
+	oom := cg != nil && cg.MemoryEvents().OOMKill > 0
 	if oom && mode == Foreground {
 		fmt.Fprintf(os.Stderr, "minibox: container was OOM-killed (memory limit %d bytes); raise --memory\n", c.Config.Limits.MemoryBytes)
 	}

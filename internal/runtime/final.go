@@ -15,6 +15,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"minibox/internal/security"
 )
 
 // resolveUser maps "uid[:gid]" or "name[:group]" to ids using the container's /etc/passwd and /etc/group.
@@ -92,9 +94,35 @@ func DropUser(user string) error {
 	return nil
 }
 
+// Harden applies capability limits, no_new_privs and the seccomp profile to the calling
+// (locked) thread, so that everything it forks or execs inherits them. With a non-root user the
+// capabilities vanish at setuid; SETUID/SETGID stay in the bounding set until then.
+func Harden(caps []string, seccomp bool, user string) error {
+	keep := append([]string(nil), caps...)
+	if user != "" && user != "0" && user != "root" {
+		keep = append(keep, "SETUID", "SETGID")
+	}
+	if caps != nil {
+		if err := security.ApplyCaps(keep); err != nil {
+			return err
+		}
+	}
+	if err := security.NoNewPrivs(); err != nil {
+		return err
+	}
+	if seccomp {
+		return security.ApplySeccomp(caps)
+	}
+	return nil
+}
+
 // execFinal runs the user command: directly (execve) or, with spec.Init, as a child of
 // a minimal PID 1 that reaps orphans and forwards signals.
 func execFinal(spec *InitSpec, path string) error {
+	goruntime.LockOSThread() // capability and no_new_privs state is per-thread: exec/fork from this one
+	if err := Harden(spec.Caps, spec.Seccomp, spec.User); err != nil {
+		return err
+	}
 	if !spec.Init {
 		if spec.TTY {
 			if _, err := unix.Setsid(); err != nil {
@@ -162,6 +190,8 @@ type ExecSpec struct {
 	Workdir string
 	User    string
 	TTY     bool
+	Caps    []string
+	Seccomp bool
 }
 
 // ExecInit is the hidden `exec-init` helper: it enters the container's ipc/uts/net/pid
@@ -220,6 +250,10 @@ func ExecInit() (int, error) {
 	path, err := lookPath(spec.Cmd[0], spec.Env)
 	if err != nil {
 		return 127, err
+	}
+	goruntime.LockOSThread()
+	if err := Harden(spec.Caps, spec.Seccomp, spec.User); err != nil {
+		return 125, err
 	}
 	attr := &syscall.ProcAttr{Env: spec.Env, Files: []uintptr{0, 1, 2}}
 	sys := &syscall.SysProcAttr{}

@@ -27,7 +27,10 @@ type ExtractOptions struct {
 
 // DefaultExtractOptions returns options for the current process.
 func DefaultExtractOptions() ExtractOptions {
-	return ExtractOptions{OpaqueXattr: "trusted.overlay.opaque", Privileged: os.Geteuid() == 0}
+	if os.Geteuid() != 0 {
+		return ExtractOptions{OpaqueXattr: "user.overlay.opaque", Privileged: false}
+	}
+	return ExtractOptions{OpaqueXattr: "trusted.overlay.opaque", Privileged: true}
 }
 
 // ExtractTar unpacks an (uncompressed) tar stream into dir, which must exist.
@@ -376,7 +379,7 @@ func (e *extractor) whiteout(parts []string, h *tar.Header) error {
 		return fmt.Errorf("invalid whiteout name %q", name)
 	}
 	if !e.opts.Privileged {
-		return errors.New("creating overlay whiteouts needs CAP_MKNOD (rootless layers are handled in M8)")
+		return e.xwhiteout(dir, target)
 	}
 	pfd, err := e.parent(dir, true)
 	if err != nil {
@@ -391,6 +394,40 @@ func (e *extractor) whiteout(parts []string, h *tar.Header) error {
 		err = unix.Mknodat(pfd, target, unix.S_IFCHR|0o000, 0)
 	}
 	return err
+}
+
+// xwhiteout creates an "xattr whiteout" for unprivileged extraction (no CAP_MKNOD): an empty
+// regular file carrying user.overlay.whiteout, in a directory marked user.overlay.opaque=x
+// (overlayfs with userxattr, Linux 6.8+ "xwhiteouts"). In a directory that is already fully
+// opaque ("y") whiteouts are redundant and skipped.
+func (e *extractor) xwhiteout(dir []string, target string) error {
+	dfd, err := e.openDir(dir, true)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(dfd)
+	buf := make([]byte, 4)
+	if n, err := unix.Fgetxattr(dfd, "user.overlay.opaque", buf); err == nil && n == 1 && buf[0] == 'y' {
+		return nil
+	}
+	_ = unix.Unlinkat(dfd, target, 0)
+	fd, err := unix.Openat(dfd, target, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if err == unix.EISDIR || err == unix.EEXIST {
+			if err = e.removeAt(dfd, append(append([]string(nil), dir...), target)); err != nil {
+				return err
+			}
+			fd, err = unix.Openat(dfd, target, unix.O_CREAT|unix.O_EXCL|unix.O_WRONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		}
+		if err != nil {
+			return fmt.Errorf("create xattr whiteout for %s: %w", target, err)
+		}
+	}
+	defer unix.Close(fd)
+	if err := unix.Fsetxattr(fd, "user.overlay.whiteout", []byte("y"), 0); err != nil {
+		return fmt.Errorf("mark xattr whiteout (needs a filesystem with user xattrs): %w", err)
+	}
+	return unix.Fsetxattr(dfd, "user.overlay.opaque", []byte("x"), 0)
 }
 
 // allowedXattrs keeps only xattrs that are safe in a layer: file capabilities

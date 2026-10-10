@@ -46,7 +46,10 @@ type InitSpec struct {
 	User     string      // "uid[:gid]" or a name from the container's /etc/passwd
 	TTY      bool        // fd 0 is a pty slave to become the controlling terminal
 	Binds    [][2]string // [host src, container dst] file bind mounts (resolv.conf, hosts)
-	Init     bool        // stay as PID 1: reap zombies, forward signals, then exit with the child's status
+	Caps     []string    // capabilities to keep (nil = untouched, run-raw)
+	Seccomp  bool
+	ReadOnly bool
+	Init     bool // stay as PID 1: reap zombies, forward signals, then exit with the child's status
 }
 
 // RunRaw runs a command in new PID/mount/UTS/IPC/net namespaces on a pivot_rooted
@@ -218,6 +221,11 @@ func Init() error {
 	}
 	if err := setupRootfs(spec.Rootfs); err != nil {
 		return err
+	}
+	if spec.ReadOnly {
+		if err := unix.Mount("", "/", "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_RDONLY, ""); err != nil {
+			return fmt.Errorf("remount rootfs read-only: %w", err)
+		}
 	}
 	if spec.Workdir != "" {
 		if err := unix.Chdir(spec.Workdir); err != nil {

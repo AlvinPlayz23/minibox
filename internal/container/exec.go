@@ -39,12 +39,15 @@ func Exec(c *Container, o ExecOptions) (int, error) {
 		return 125, fmt.Errorf("container %s is not running (status: %s); start one with `minibox run -d` first", short(c.Config.ID), c.DisplayStatus())
 	}
 	spec := runtime.ExecSpec{Pid: c.State.Pid, Cmd: o.Cmd, Env: append(append([]string(nil), c.Config.Env...), o.Env...),
-		Workdir: o.Workdir, User: o.User, TTY: o.TTY}
+		Workdir: o.Workdir, User: o.User, TTY: o.TTY, Caps: c.Config.Caps, Seccomp: c.Config.Seccomp}
 	if spec.Workdir == "" {
 		spec.Workdir = c.Config.Workdir
 	}
 	if spec.User == "" {
 		spec.User = c.Config.User
+	}
+	if os.Geteuid() != 0 {
+		return 125, errors.New("exec is not supported rootless yet (joining the user namespace needs a single-threaded helper); use `minibox run` with the command directly")
 	}
 	cg := &cgroup.Cgroup{Path: cgroup.Base() + "/" + c.Config.ID}
 	fd, err := cg.OpenFD()
@@ -135,8 +138,10 @@ func Exec(c *Container, o ExecOptions) (int, error) {
 // Prune finalises dead containers and removes leftover cgroups, lock files and
 // half-created container directories. Returns the number of things cleaned.
 func Prune() (int, error) {
-	if err := cgroup.Check(); err != nil {
-		return 0, err
+	if os.Geteuid() == 0 {
+		if err := cgroup.Check(); err != nil {
+			return 0, err
+		}
 	}
 	n := 0
 	for _, c := range List() {
@@ -170,7 +175,7 @@ func Prune() (int, error) {
 			n += k
 		}
 	}
-	for _, id := range cgroup.List() {
+	for _, id := range cgroupList() {
 		if state.IsAlive(id) {
 			continue
 		}
@@ -184,4 +189,11 @@ func Prune() (int, error) {
 		n++
 	}
 	return n, nil
+}
+
+func cgroupList() []string {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return cgroup.List()
 }
