@@ -263,7 +263,7 @@ func TestLoadCLIAndRun(t *testing.T) {
 	s := newRoot(t)
 	tmp := filepath.Join(t.TempDir(), "rootfs.tar")
 	os.WriteFile(tmp, baseLayer(t), 0o644)
-	if out, err := mb(t, "load", "-i", tmp, "alpine:3"); err != nil || !strings.Contains(out, "Loaded local/alpine:3") {
+	if out, err := mb(t, "load", "-i", tmp, "alpine:3"); err != nil || !strings.Contains(out, "Loaded docker.io/library/alpine:3") {
 		t.Fatalf("%v %s", err, out)
 	}
 	out, err := runImg(t, "--image", "alpine:3", "/bin/sh", "-c", "echo $PATH; hostname; ps | wc -l")
@@ -326,13 +326,13 @@ func TestKilledSupervisorThenPrune(t *testing.T) {
 	if ents, _ := os.ReadDir(filepath.Join(s.Root, "containers")); len(ents) != 1 {
 		t.Fatalf("expected live container dir")
 	}
-	if out, _ := mb(t, "system", "prune"); !strings.Contains(out, "removed 0") {
+	if out, _ := mb(t, "system", "prune"); !strings.Contains(out, "removed 0 stale") {
 		t.Errorf("prune touched a live container: %s", out)
 	}
 	cmd.Process.Kill()
 	cmd.Wait()
 	time.Sleep(300 * time.Millisecond)
-	if out, err := mb(t, "system", "prune"); err != nil || strings.Contains(out, "removed 0") {
+	if out, err := mb(t, "system", "prune"); err != nil || strings.Contains(out, "removed 0 stale") {
 		t.Errorf("prune did nothing: %v %s", err, out)
 	}
 	if ents, _ := os.ReadDir(filepath.Join(s.Root, "containers")); len(ents) != 0 {

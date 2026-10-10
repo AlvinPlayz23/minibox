@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -114,6 +115,7 @@ func Run(args []string) {
 	cfg := container.Config{Name: *name, Interactive: *inter || *tty, TTY: *tty, Init: *initF, Rm: *rm,
 		Detach: *detach, Workdir: *workdir, User: *user, Hostname: *host}
 	rest := fs.Args()
+	var unlock func()
 	var imgCfg image.Config
 	if *rootfs != "" {
 		abs, err := filepath.Abs(*rootfs)
@@ -127,11 +129,22 @@ func Run(args []string) {
 		imgCfg.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 	} else {
 		st := &image.Store{Root: state.Root()}
+		var err error
+		unlock, err = st.RLock()
+		if err != nil {
+			die(125, "lock image store: %v", err)
+		}
 		img, err := st.GetImage(rest[0])
 		if err != nil {
-			die(125, "%v", err)
+			if _, perr := image.ParseReference(rest[0]); perr != nil {
+				die(125, "%v", perr)
+			}
+			fmt.Fprintf(os.Stderr, "Unable to find image %q locally\n", rest[0])
+			if img, err = st.Pull(context.Background(), image.NewClient(), rest[0], os.Stderr); err != nil {
+				die(125, "pull %s: %v", rest[0], err)
+			}
 		}
-		cfg.Image, imgCfg, rest = rest[0], img.Config, rest[1:]
+		cfg.Image, imgCfg, rest = img.Name, img.Config, rest[1:]
 		if *workdir == "" {
 			cfg.Workdir = img.Config.WorkingDir
 		}
@@ -167,6 +180,9 @@ func Run(args []string) {
 	c, err := container.Create(cfg)
 	if err != nil {
 		die(125, "%v", err)
+	}
+	if unlock != nil {
+		unlock()
 	}
 	if *detach {
 		runDetached(c)
@@ -453,4 +469,129 @@ func Prune() {
 		die(1, "prune: %v", err)
 	}
 	fmt.Printf("removed %d stale container resource(s) (cgroups, container dirs)\n", n)
+	st := &image.Store{Root: state.Root()}
+	res, err := st.GC(true)
+	switch {
+	case err != nil:
+		die(1, "prune images: %v", err)
+	case res == nil:
+		fmt.Println("skipped image cleanup: a pull or run is in progress")
+	default:
+		fmt.Printf("removed %d unused layer(s), %d compressed blob(s), %d temp file(s)\n", res.Layers, res.Blobs, res.Temp)
+	}
+}
+
+func peakRSS() string {
+	b, _ := os.ReadFile("/proc/self/status")
+	for _, l := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(l, "VmHWM:") {
+			return strings.TrimSpace(strings.TrimPrefix(l, "VmHWM:"))
+		}
+	}
+	return "unknown"
+}
+
+// Pull implements `minibox pull [--stats] IMAGE`.
+func Pull(args []string) {
+	fs := flag.NewFlagSet("pull", flag.ExitOnError)
+	stats := fs.Bool("stats", false, "print duration and peak RSS")
+	q := fs.Bool("q", false, "quiet: no progress output")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		die(2, "usage: minibox pull [-q] [--stats] IMAGE")
+	}
+	var log io.Writer = os.Stderr
+	if *q {
+		log = io.Discard
+	}
+	t0 := time.Now()
+	st := &image.Store{Root: state.Root()}
+	img, err := st.Pull(context.Background(), image.NewClient(), fs.Arg(0), log)
+	if err != nil {
+		die(1, "pull %s: %v", fs.Arg(0), err)
+	}
+	fmt.Println(img.Name)
+	if *stats {
+		fmt.Fprintf(os.Stderr, "pulled in %v, peak RSS %s, %d layer(s), %d MB compressed\n", time.Since(t0).Round(time.Millisecond), peakRSS(), len(img.Layers), img.Size>>20)
+	}
+}
+
+// Images implements `minibox images [--json]`.
+func Images(args []string) {
+	fs := flag.NewFlagSet("images", flag.ExitOnError)
+	js := fs.Bool("json", false, "output JSON")
+	fs.Parse(args)
+	st := &image.Store{Root: state.Root()}
+	imgs, err := st.ListImages()
+	if err != nil {
+		die(1, "%v", err)
+	}
+	if *js {
+		if imgs == nil {
+			imgs = []*image.Image{}
+		}
+		b, _ := json.MarshalIndent(imgs, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "REPOSITORY\tTAG\tIMAGE ID\tCREATED\tSIZE")
+	for _, img := range imgs {
+		ref, _ := image.ParseReference(img.Name)
+		repo, tag := ref.Registry+"/"+ref.Repo, ref.Tag
+		if ref.Registry == "docker.io" {
+			repo = strings.TrimPrefix(ref.Repo, "library/")
+		}
+		if ref.Digest != "" {
+			tag = "<none>"
+		}
+		id := img.Digest
+		if id == "" && len(img.Layers) > 0 {
+			id = img.Layers[len(img.Layers)-1].DiffID
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%.1fMB\n", repo, tag, shortID(id), human(img.Created), float64(img.Size)/1e6)
+	}
+	w.Flush()
+}
+
+func shortID(d string) string {
+	d = strings.TrimPrefix(d, "sha256:")
+	if len(d) > 12 {
+		return d[:12]
+	}
+	return d
+}
+
+// Rmi implements `minibox rmi IMAGE...`.
+func Rmi(args []string) {
+	if len(args) < 1 {
+		die(2, "usage: minibox rmi IMAGE...")
+	}
+	st := &image.Store{Root: state.Root()}
+	inUse := map[string]string{}
+	for _, c := range container.List() {
+		inUse[c.Config.Image] = container.Short(c.Config.ID)
+	}
+	rc := 0
+	for _, a := range args {
+		ref, err := image.ParseReference(a)
+		if err == nil {
+			if id, ok := inUse[ref.Name()]; ok {
+				fmt.Fprintf(os.Stderr, "minibox: image %s is used by container %s; remove it first (`minibox rm %s`)\n", a, id, id)
+				rc = 1
+				continue
+			}
+		}
+		name, err := st.RemoveImage(a)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "minibox: %v\n", err)
+			rc = 1
+			continue
+		}
+		fmt.Println("Untagged:", name)
+	}
+	if res, err := st.GC(false); err == nil && res != nil && res.Layers > 0 {
+		fmt.Printf("Removed %d unused layer(s)\n", res.Layers)
+	}
+	os.Exit(rc)
 }

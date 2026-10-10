@@ -24,6 +24,12 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		cli.Run(os.Args[2:])
+	case "pull":
+		cli.Pull(os.Args[2:])
+	case "images":
+		cli.Images(os.Args[2:])
+	case "rmi":
+		cli.Rmi(os.Args[2:])
 	case "ps":
 		cli.Ps(os.Args[2:])
 	case "stop":

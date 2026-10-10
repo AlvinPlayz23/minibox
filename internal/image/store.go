@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sys/unix"
 )
 
@@ -207,6 +208,12 @@ func (s *Store) HasLayer(chainID string) bool {
 // place atomically, so a crash never leaves a half-unpacked layer. If the
 // same layer already exists the new copy is discarded.
 func (s *Store) UnpackLayer(parent string, r io.Reader, opts ExtractOptions) (*Layer, error) {
+	return s.UnpackLayerVerified(parent, r, opts, "")
+}
+
+// UnpackLayerVerified is UnpackLayer, but if wantDiffID is set the layer is only
+// published when the uncompressed stream hashes to it.
+func (s *Store) UnpackLayerVerified(parent string, r io.Reader, opts ExtractOptions, wantDiffID string) (*Layer, error) {
 	if err := os.MkdirAll(s.layersDir(), 0o755); err != nil {
 		return nil, err
 	}
@@ -232,6 +239,9 @@ func (s *Store) UnpackLayer(parent string, r io.Reader, opts ExtractOptions) (*L
 		return nil, err
 	}
 	l := &Layer{DiffID: "sha256:" + hex.EncodeToString(h.Sum(nil)), Parent: parent}
+	if wantDiffID != "" && wantDiffID != l.DiffID {
+		return nil, fmt.Errorf("layer diffID mismatch: image config says %s but content hashes to %s (corrupted or tampered layer)", wantDiffID, l.DiffID)
+	}
 	l.ChainID = ChainID(parent, l.DiffID)
 	meta, _ := json.Marshal(l)
 	if err := os.WriteFile(filepath.Join(tmp, "meta.json"), meta, 0o644); err != nil {
@@ -313,29 +323,30 @@ type Image struct {
 	Layers  []ImageLayer `json:"layers"`
 	Config  Config       `json:"config"`
 	Created time.Time    `json:"created"`
+	Digest  string       `json:"digest,omitempty"` // manifest digest (pulled images)
+	Size    int64        `json:"size,omitempty"`   // compressed layer bytes
 }
 
 var nameRe = lazyRe(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 var tagRe = lazyRe(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 
-// localRef splits NAME[:TAG] into a store path. Full reference parsing arrives with M6.
+// imagePath maps a reference to images/<registry>/<repo>/<tag>.json and returns its canonical name.
 func (s *Store) imagePath(name string) (string, string, error) {
-	repo, tag := name, "latest"
-	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i:], "/") {
-		repo, tag = name[:i], name[i+1:]
+	ref, err := ParseReference(name)
+	if err != nil {
+		return "", "", err
 	}
-	if !nameRe().MatchString(repo) || len(repo) > 255 {
-		return "", "", fmt.Errorf("invalid image name %q; use lowercase letters, digits, '.', '_', '-' and '/' (e.g. myapp or team/app:1.0)", name)
-	}
-	if !tagRe().MatchString(tag) {
-		return "", "", fmt.Errorf("invalid tag %q in %q", tag, name)
-	}
-	for _, c := range strings.Split(repo, "/") {
+	for _, c := range strings.Split(ref.Repo, "/") {
 		if c == "." || c == ".." {
 			return "", "", fmt.Errorf("invalid image name %q", name)
 		}
 	}
-	return filepath.Join(s.Root, "images", "local", filepath.FromSlash(repo), tag+".json"), "local/" + repo + ":" + tag, nil
+	file := ref.Tag + ".json"
+	if ref.Digest != "" {
+		file = "@" + strings.Replace(ref.Digest, ":", "-", 1) + ".json"
+	}
+	host := strings.ReplaceAll(ref.Registry, ":", "_")
+	return filepath.Join(s.Root, "images", host, filepath.FromSlash(ref.Repo), file), ref.Name(), nil
 }
 
 // SaveImage writes the image record atomically.
@@ -386,7 +397,11 @@ func Decompress(r io.Reader) (io.Reader, error) {
 	case len(magic) >= 2 && magic[0] == 0x1f && magic[1] == 0x8b:
 		return gzip.NewReader(br)
 	case len(magic) == 4 && magic[0] == 0x28 && magic[1] == 0xb5 && magic[2] == 0x2f && magic[3] == 0xfd:
-		return nil, errors.New("zstd-compressed tarballs are not supported yet (arrives with M6); decompress first or use gzip")
+		zr, err := zstd.NewReader(br, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(256<<20))
+		if err != nil {
+			return nil, err
+		}
+		return zr.IOReadCloser(), nil
 	}
 	return br, nil
 }

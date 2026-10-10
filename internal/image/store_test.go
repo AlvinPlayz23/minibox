@@ -83,10 +83,10 @@ func TestImageNameValidation(t *testing.T) {
 		}
 	}
 	p, canon, err := s.imagePath("team/app:1.0")
-	if err != nil || p != "/r/images/local/team/app/1.0.json" || canon != "local/team/app:1.0" {
+	if err != nil || p != "/r/images/docker.io/team/app/1.0.json" || canon != "docker.io/team/app:1.0" {
 		t.Errorf("%s %s %v", p, canon, err)
 	}
-	if _, canon, _ := s.imagePath("alpine"); canon != "local/alpine:latest" {
+	if _, canon, _ := s.imagePath("alpine"); canon != "docker.io/library/alpine:latest" {
 		t.Error(canon)
 	}
 }
